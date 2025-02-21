@@ -51,13 +51,15 @@ class MultiHeadSpectralAttention(nn.Module):
         else:
             filter_used = self.base_filter.unsqueeze(0)  # (1, num_heads, seq_len, head_dim)
 
-        # In-place multiply the FFT result by the filter (broadcasting works with complex * real)
-        F_fft.mul_(filter_used)
+        # Apply the filter in the frequency domain.
+        F_fft = F_fft * filter_used
         
-        # Apply non-linearity in place on the real and imaginary parts
-        F_fft.real.copy_(self.activation(F_fft.real))
-        F_fft.imag.copy_(self.activation(F_fft.imag))
+        # Non-linear activation for the frequency domain
+        real_part = F_fft.real
+        imag_part = F_fft.imag
         
+        F_fft = self.activation(real_part) + 1j * self.activation(imag_part)
+
         # Inverse FFT back to the token domain; take only the real part.
         x_filtered = torch.fft.ifft(F_fft, dim=2).real  # (B, num_heads, seq_len, head_dim)
         
