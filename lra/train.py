@@ -35,24 +35,25 @@ def main():
                         help="Input dimension per token (e.g. 1 for scalar tokens)")
     parser.add_argument('--num_classes', type=int, default=2,
                         help="Number of classes for classification")
+    # Adjusted hyperparameters for LRA tasks.
     parser.add_argument('--batch_size', type=int, default=4,
                         help="Batch size per GPU")
-    parser.add_argument('--epochs', type=int, default=300,
+    parser.add_argument('--epochs', type=int, default=100,
                         help="Number of training epochs")
-    parser.add_argument('--learning_rate', type=float, default=7e-4,
+    parser.add_argument('--learning_rate', type=float, default=5e-4,
                         help="Learning rate")
-    parser.add_argument('--depth', type=int, default=12,
+    parser.add_argument('--depth', type=int, default=6,
                         help="Transformer depth")
-    parser.add_argument('--embed_dim', type=int, default=768,
+    parser.add_argument('--embed_dim', type=int, default=256,
                         help="Embedding dimension")
     parser.add_argument('--mlp_ratio', type=float, default=4.0,
                         help="MLP expansion ratio")
-    parser.add_argument('--num_heads', type=int, default=12,
+    parser.add_argument('--num_heads', type=int, default=8,
                         help="Number of attention heads")
     parser.add_argument('--dropout', type=float, default=0.1,
                         help="Dropout rate")
     args = parser.parse_args()
-
+    
     # Define a simple tokenizer function.
     def simple_tokenizer(source, max_length):
         # For text input (IMDB or ListOps), we convert characters to their ordinal values.
@@ -89,7 +90,8 @@ def main():
         val_dataset = ListOpsDataset(config, split='eval')
         args.input_dim = 1
         args.seq_len = args.max_length
-        # Adjust num_classes if needed.
+        args.num_classes = 10  # Correct the number of classes for ListOps.
+
     elif args.dataset == 'cifar10':
         train_dataset = Cifar10Dataset(config, split='train')
         val_dataset = Cifar10Dataset(config, split='eval')
