@@ -4,7 +4,7 @@ import torch.nn as nn
 class MultiHeadSpectralAttention(nn.Module):
     def __init__(self, embed_dim, seq_len, num_heads=4, dropout=0.1, adaptive=True):
         """
-        Memory-efficient multi‐head spectral attention.
+        Memory-efficient multi‐head spectral attention using real FFT.
           - embed_dim: total embedding dimension.
           - seq_len: sequence length (e.g. number of patches + 1 for the class token).
           - num_heads: number of attention heads.
@@ -19,17 +19,19 @@ class MultiHeadSpectralAttention(nn.Module):
         self.seq_len = seq_len
         self.adaptive = adaptive
 
+        # When using rfft, the frequency dimension is reduced to seq_len//2+1.
+        self.freq_bins = seq_len // 2 + 1
+
         # Instead of a full (num_heads, seq_len, head_dim) filter,
-        # we use (num_heads, seq_len, 1) so that a single scalar modulates
-        # each frequency bin and is broadcast along the head dimension.
-        self.base_filter = nn.Parameter(torch.ones(num_heads, seq_len, 1))
+        # we use (num_heads, freq_bins, 1) so that a single scalar modulates
+        # each frequency bin and is broadcast along the head_dim.
+        self.base_filter = nn.Parameter(torch.ones(num_heads, self.freq_bins, 1))
         if adaptive:
-            # Adaptive MLP now outputs (B, num_heads * seq_len) instead of
-            # (B, num_heads * seq_len * head_dim) to reduce memory usage.
+            # Adaptive MLP outputs (B, num_heads * freq_bins) which reshapes to (B, num_heads, freq_bins, 1)
             self.adaptive_mlp = nn.Sequential(
                 nn.Linear(embed_dim, embed_dim),
                 nn.GELU(),
-                nn.Linear(embed_dim, num_heads * seq_len)
+                nn.Linear(embed_dim, num_heads * self.freq_bins)
             )
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(embed_dim)
@@ -42,30 +44,32 @@ class MultiHeadSpectralAttention(nn.Module):
         # Reshape to (B, num_heads, seq_len, head_dim) without extra copies.
         x_heads = x.view(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         
-        # Compute FFT along the token dimension; result is a complex tensor.
-        F_fft = torch.fft.fft(x_heads, dim=2)
+        # Compute the real FFT along the token dimension.
+        # F_fft shape: (B, num_heads, freq_bins, head_dim)
+        F_fft = torch.fft.rfft(x_heads, dim=2)
         
-        # Compute the filter.
+        # Compute the frequency filter.
         if self.adaptive:
-            # Compute global context from all tokens.
-            context = x.mean(dim=1)  # (B, embed_dim)
-            # Output shape: (B, num_heads * seq_len) then reshape to (B, num_heads, seq_len, 1)
-            mod = self.adaptive_mlp(context).view(B, self.num_heads, self.seq_len, 1)
-            filter_used = self.base_filter.unsqueeze(0) + mod  # (B, num_heads, seq_len, 1)
+            # Global context: (B, embed_dim)
+            context = x.mean(dim=1)
+            # Adaptive modulation: (B, num_heads * freq_bins) -> (B, num_heads, freq_bins, 1)
+            mod = self.adaptive_mlp(context).view(B, self.num_heads, self.freq_bins, 1)
+            filter_used = self.base_filter.unsqueeze(0) + mod  # (B, num_heads, freq_bins, 1)
         else:
-            filter_used = self.base_filter.unsqueeze(0)  # (1, num_heads, seq_len, 1)
+            filter_used = self.base_filter.unsqueeze(0)  # (1, num_heads, freq_bins, 1)
 
-        # Apply the filter in the frequency domain (broadcasting over head_dim).
+        # Apply the filter in the frequency domain (broadcasting along head_dim).
         F_fft = F_fft * filter_used
         
-        # Apply non-linear activation to the real and imaginary parts.
+        # Apply non-linear activation separately to real and imaginary parts.
         F_fft = torch.complex(self.activation(F_fft.real),
                               self.activation(F_fft.imag))
 
-        # Inverse FFT back to the token domain; we take the real part.
-        x_filtered = torch.fft.ifft(F_fft, dim=2).real  # (B, num_heads, seq_len, head_dim)
+        # Inverse real FFT back to the token domain.
+        # Specify n=self.seq_len to recover the original sequence length.
+        x_filtered = torch.fft.irfft(F_fft, dim=2, n=self.seq_len)  # (B, num_heads, seq_len, head_dim)
         
-        # Merge heads back: (B, seq_len, embed_dim)
+        # Merge heads back to (B, seq_len, embed_dim).
         x_filtered = x_filtered.permute(0, 2, 1, 3).reshape(B, N, D)
         
         # Residual connection with dropout and layer normalization.
