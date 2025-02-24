@@ -34,8 +34,8 @@ class MultiHeadSpectralAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(embed_dim)
         
-        # Learnable bias for modReLU, shape (num_heads, freq_bins, 1)
-        self.modrelu_bias = nn.Parameter(torch.zeros(num_heads, self.freq_bins, 1))
+        # Initialize modReLU bias with a small negative value for stability.
+        self.modrelu_bias = nn.Parameter(torch.full((num_heads, self.freq_bins, 1), -0.1))
 
     def modrelu(self, z):
         """
@@ -44,14 +44,14 @@ class MultiHeadSpectralAttention(nn.Module):
         Returns:
           - Activated complex tensor with the same shape.
         """
-        # Compute the magnitude of z.
         z_abs = torch.abs(z)
-        # Broadcast the bias: shape (1, num_heads, freq_bins, 1)
         bias = self.modrelu_bias.unsqueeze(0)
+        # Clamp the magnitude to avoid division by very small numbers.
+        z_abs_clamped = torch.clamp(z_abs, min=1e-3)
         # Compute the activated magnitude: ReLU(|z| + bias)
         activated = torch.relu(z_abs + bias)
-        # Scale factor: avoid division by zero with a small epsilon.
-        scale = activated / (z_abs + 1e-6)
+        # Compute scale safely.
+        scale = activated / z_abs_clamped
         return z * scale
 
     def forward(self, x):
@@ -68,8 +68,11 @@ class MultiHeadSpectralAttention(nn.Module):
         if self.adaptive:
             # Global context: (B, embed_dim)
             context = x.mean(dim=1)
-            # Adaptive modulation: (B, num_heads * freq_bins) -> (B, num_heads, freq_bins, 1)
-            mod = self.adaptive_mlp(context).view(B, self.num_heads, self.freq_bins, 1)
+            # Adaptive modulation: (B, num_heads * freq_bins)
+            mod = self.adaptive_mlp(context)
+            # Bound the MLP outputs to keep them in a reasonable range.
+            mod = torch.tanh(mod)
+            mod = mod.view(B, self.num_heads, self.freq_bins, 1)
             filter_used = self.base_filter.unsqueeze(0) + mod  # (B, num_heads, freq_bins, 1)
         else:
             filter_used = self.base_filter.unsqueeze(0)  # (1, num_heads, freq_bins, 1)
