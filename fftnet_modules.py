@@ -22,12 +22,10 @@ class MultiHeadSpectralAttention(nn.Module):
         # When using rfft, the frequency dimension is reduced to seq_len//2+1.
         self.freq_bins = seq_len // 2 + 1
 
-        # Instead of a full (num_heads, seq_len, head_dim) filter,
-        # we use (num_heads, freq_bins, 1) so that a single scalar modulates
-        # each frequency bin and is broadcast along the head_dim.
+        # Base filter: shape (num_heads, freq_bins, 1)
         self.base_filter = nn.Parameter(torch.ones(num_heads, self.freq_bins, 1))
         if adaptive:
-            # Adaptive MLP outputs (B, num_heads * freq_bins) which reshapes to (B, num_heads, freq_bins, 1)
+            # Adaptive MLP outputs (B, num_heads * freq_bins) reshaped to (B, num_heads, freq_bins, 1)
             self.adaptive_mlp = nn.Sequential(
                 nn.Linear(embed_dim, embed_dim),
                 nn.GELU(),
@@ -35,18 +33,36 @@ class MultiHeadSpectralAttention(nn.Module):
             )
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(embed_dim)
-        self.activation = nn.GELU()
+        
+        # Learnable bias for modReLU, shape (num_heads, freq_bins, 1)
+        self.modrelu_bias = nn.Parameter(torch.zeros(num_heads, self.freq_bins, 1))
+
+    def modrelu(self, z):
+        """
+        Applies the modReLU activation on a complex tensor.
+          - z: complex tensor of shape (B, num_heads, freq_bins, head_dim)
+        Returns:
+          - Activated complex tensor with the same shape.
+        """
+        # Compute the magnitude of z.
+        z_abs = torch.abs(z)
+        # Broadcast the bias: shape (1, num_heads, freq_bins, 1)
+        bias = self.modrelu_bias.unsqueeze(0)
+        # Compute the activated magnitude: ReLU(|z| + bias)
+        activated = torch.relu(z_abs + bias)
+        # Scale factor: avoid division by zero with a small epsilon.
+        scale = activated / (z_abs + 1e-6)
+        return z * scale
 
     def forward(self, x):
         # x shape: (B, seq_len, embed_dim)
         B, N, D = x.shape
 
-        # Reshape to (B, num_heads, seq_len, head_dim) without extra copies.
+        # Reshape to (B, num_heads, seq_len, head_dim)
         x_heads = x.view(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         
-        # Compute the real FFT along the token dimension.
-        # F_fft shape: (B, num_heads, freq_bins, head_dim)
-        F_fft = torch.fft.rfft(x_heads, dim=2)
+        # Compute the real FFT along the token dimension using orthogonal normalization.
+        F_fft = torch.fft.rfft(x_heads, dim=2, norm='ortho')
         
         # Compute the frequency filter.
         if self.adaptive:
@@ -58,16 +74,14 @@ class MultiHeadSpectralAttention(nn.Module):
         else:
             filter_used = self.base_filter.unsqueeze(0)  # (1, num_heads, freq_bins, 1)
 
-        # Apply the filter in the frequency domain (broadcasting along head_dim).
+        # Apply the frequency filter.
         F_fft = F_fft * filter_used
         
-        # Apply non-linear activation separately to real and imaginary parts.
-        F_fft = torch.complex(self.activation(F_fft.real),
-                              self.activation(F_fft.imag))
-
-        # Inverse real FFT back to the token domain.
-        # Specify n=self.seq_len to recover the original sequence length.
-        x_filtered = torch.fft.irfft(F_fft, dim=2, n=self.seq_len)  # (B, num_heads, seq_len, head_dim)
+        # Apply modReLU activation to the complex FFT coefficients.
+        F_fft = self.modrelu(F_fft)
+        
+        # Inverse FFT back to the token domain using orthogonal normalization.
+        x_filtered = torch.fft.irfft(F_fft, dim=2, n=self.seq_len, norm='ortho')  # (B, num_heads, seq_len, head_dim)
         
         # Merge heads back to (B, seq_len, embed_dim).
         x_filtered = x_filtered.permute(0, 2, 1, 3).reshape(B, N, D)
