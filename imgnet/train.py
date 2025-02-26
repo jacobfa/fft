@@ -2,6 +2,7 @@
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,7 +12,6 @@ from torch.utils.checkpoint import checkpoint
 from torch.cuda.amp import autocast, GradScaler
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-from fftnet_vit import FFTNetViT 
 from tqdm import tqdm
 import threading
 import logging
@@ -29,6 +29,11 @@ def checkpointed_forward(x, model):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Distributed training with DeiT and FFTNetViT")
+    parser.add_argument('--model', default='deit_base_patch16_224', type=str,
+                        help="Model to train: use 'fftnet_vit' for custom FFTNetViT, or a timm model name (e.g. deit_base_patch16_224)")
+    args = parser.parse_args()
+
     # Distributed training setup.
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -37,7 +42,7 @@ def main():
     device = torch.device("cuda", local_rank)
     dist.init_process_group(backend="nccl", init_method="env://")
 
-    # Setup logging (only on rank 0).
+    # Setup logging on rank 0.
     if rank == 0:
         logging.basicConfig(level=logging.INFO,
                             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -104,7 +109,14 @@ def main():
     )
 
     # Model creation and wrapping for distributed training.
-    model = FFTNetViT().to(device)
+    if args.model.lower() == 'fftnet_vit':
+        # Import your custom FFTNetViT model.
+        from fftnet_vit import FFTNetViT
+        model = FFTNetViT().to(device)
+    else:
+        # Use timm to create a DeiT (or other) model.
+        import timm
+        model = timm.create_model(args.model, pretrained=False, num_classes=1000).to(device)
     model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
 
     # Cross-entropy loss with label smoothing.
