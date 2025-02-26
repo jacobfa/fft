@@ -10,7 +10,7 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.checkpoint import checkpoint
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 import threading
 import logging
@@ -27,6 +27,34 @@ import torchvision.datasets as datasets
 
 # Enable CuDNN benchmark for improved performance.
 torch.backends.cudnn.benchmark = True
+
+# === Monkey Patch for Hue Adjustment to Avoid OverflowError ===
+import numpy as np
+from PIL import Image
+import torchvision.transforms.functional as F_pil
+
+def safe_adjust_hue(img, hue_factor):
+    """
+    Adjust the hue of an image while handling negative hue factors.
+    Instead of directly converting hue_factor*255 to np.uint8 (which fails for negatives),
+    we compute an integer offset and wrap it with modulo 256.
+    """
+    if not (-0.5 <= hue_factor <= 0.5):
+        raise ValueError('hue_factor is not in [-0.5, 0.5].')
+    # Convert image to HSV.
+    hsv = img.convert('HSV')
+    np_hsv = np.array(hsv)
+    # Calculate hue offset: multiply by 255, round and wrap modulo 256.
+    hue_offset = int(round(hue_factor * 255)) % 256
+    # Adjust the hue channel (channel 0).
+    np_hsv[..., 0] = (np_hsv[..., 0].astype(int) + hue_offset) % 256
+    # Convert back to RGB.
+    new_img = Image.fromarray(np_hsv, mode='HSV').convert('RGB')
+    return new_img
+
+# Monkey-patch the adjust_hue function in torchvision.transforms.functional_pil.
+F_pil.adjust_hue = safe_adjust_hue
+# === End of Monkey Patch ===
 
 # EMA helper class.
 class ModelEma:
@@ -93,7 +121,6 @@ def main():
     epochs = 300
     learning_rate = 7e-4
     weight_decay = 0.05
-    # When using cutmix, we disable label smoothing by default.
     label_smoothing = 0.0  
     warmup_epochs = 10
 
@@ -103,7 +130,6 @@ def main():
 
     # Training augmentations.
     transform_train = transforms.Compose([
-        # Randomly crop the image to 224×224 from a resized version.
         transforms.RandomResizedCrop(224, scale=(0.08, 1.0), ratio=(3/4, 4/3)),
         transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
