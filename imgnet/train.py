@@ -11,7 +11,7 @@ from torch.utils.checkpoint import checkpoint
 from torch.cuda.amp import autocast, GradScaler
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-from fftnet_vit import FFTNetViT  # Ensure FFTNetViT is defined appropriately.
+from fftnet_vit import FFTNetViT 
 from tqdm import tqdm
 import threading
 import logging
