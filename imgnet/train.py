@@ -3,6 +3,7 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import argparse
+import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -19,19 +20,49 @@ import logging
 # Use ZeroRedundancyOptimizer to offload optimizer state to CPU.
 from torch.distributed.optim import ZeroRedundancyOptimizer
 
+# Use timm's mixup implementation.
+import timm.data.mixup as mixup_fn_lib
+
 # Enable CuDNN benchmark for improved performance.
 torch.backends.cudnn.benchmark = True
 
+# EMA helper class.
+class ModelEma:
+    def __init__(self, model, decay=0.9998, device=None):
+        self.ema = copy.deepcopy(model)
+        self.decay = decay
+        self.device = device
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+        if device is not None:
+            self.ema.to(device=device)
+    def update(self, model):
+        with torch.no_grad():
+            msd = model.state_dict()
+            for k, v in self.ema.state_dict().items():
+                if k in msd:
+                    v.copy_(v * self.decay + msd[k] * (1 - self.decay))
+    def state_dict(self):
+        return self.ema.state_dict()
+
+# Soft cross entropy for mixup.
+def soft_cross_entropy(pred, soft_targets):
+    log_prob = torch.nn.functional.log_softmax(pred, dim=1)
+    return torch.mean(torch.sum(- soft_targets * log_prob, dim=1))
 
 def checkpointed_forward(x, model):
     with autocast(device_type='cuda'):
         return model(x)
 
-
 def main():
-    parser = argparse.ArgumentParser(description="Distributed training with DeiT and FFTNetViT")
+    parser = argparse.ArgumentParser(description="Optimized training for ViT/DeiT with advanced techniques")
     parser.add_argument('--model', default='deit_base_patch16_224', type=str,
-                        help="Model to train: use 'fftnet_vit' for custom FFTNetViT, or a timm model name (e.g. deit_base_patch16_224)")
+                        help="Model to train: 'fftnet_vit' for custom FFTNetViT, or a timm model name (e.g. deit_base_patch16_224)")
+    parser.add_argument('--mixup_alpha', default=0.8, type=float, help="Alpha value for mixup")
+    parser.add_argument('--cutmix_alpha', default=1.0, type=float, help="Alpha value for cutmix")
+    parser.add_argument('--use_ema', action='store_true', help="Enable EMA for model weights")
+    parser.add_argument('--ema_decay', default=0.9998, type=float, help="EMA decay rate")
+    parser.add_argument('--grad_clip', default=1.0, type=float, help="Max norm for gradient clipping")
     args = parser.parse_args()
 
     # Distributed training setup.
@@ -65,12 +96,12 @@ def main():
     transform_train = transforms.Compose([
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),  # Random jitter.
-        transforms.RandomGrayscale(p=0.2),  # Convert image to grayscale with probability 0.2.
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+        transforms.RandomGrayscale(p=0.2),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406],
                              [0.229, 0.224, 0.225]),
-        transforms.RandomErasing(p=0.25, scale=(0.02, 0.33), ratio=(0.3, 3.3), value='random')  # Random erasing.
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.33), ratio=(0.3, 3.3), value='random')
     ])
     transform_val = transforms.Compose([
         transforms.Resize(256),
@@ -90,19 +121,19 @@ def main():
 
     # DataLoaders with persistent workers and prefetching.
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
+        train_dataset,
+        batch_size=batch_size,
         sampler=train_sampler,
-        num_workers=8, 
+        num_workers=8,
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2
     )
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
+        val_dataset,
+        batch_size=batch_size,
         sampler=val_sampler,
-        num_workers=8, 
+        num_workers=8,
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2
@@ -110,18 +141,39 @@ def main():
 
     # Model creation and wrapping for distributed training.
     if args.model.lower() == 'fftnet_vit':
-        # Import your custom FFTNetViT model.
         from fftnet_vit import FFTNetViT
         model = FFTNetViT().to(device)
     else:
-        # Use timm to create a DeiT (or other) model.
         import timm
         model = timm.create_model(args.model, pretrained=False, num_classes=1000).to(device)
     model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
 
-    # Cross-entropy loss with label smoothing.
-    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing).to(device)
-    
+    # Initialize EMA if enabled.
+    if args.use_ema:
+        ema = ModelEma(model.module, decay=args.ema_decay, device=device)
+    else:
+        ema = None
+
+    # Setup mixup/cutmix.
+    mixup_fn_inst = None
+    if args.mixup_alpha > 0 or args.cutmix_alpha > 0:
+        mixup_fn_inst = mixup_fn_lib.Mixup(
+            mixup_alpha=args.mixup_alpha,
+            cutmix_alpha=args.cutmix_alpha,
+            cutmix_minmax=None,
+            prob=1.0,
+            switch_prob=0.5,
+            mode='batch',
+            label_smoothing=label_smoothing,
+            num_classes=1000)
+
+    # Loss function.
+    # If mixup is enabled, use soft cross entropy; otherwise, standard CE loss.
+    if mixup_fn_inst is not None:
+        criterion = soft_cross_entropy
+    else:
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing).to(device)
+
     # Use AdamW wrapped with ZeroRedundancyOptimizer.
     optimizer = ZeroRedundancyOptimizer(
         model.parameters(),
@@ -133,7 +185,6 @@ def main():
     # Cosine annealing scheduler (post-warmup).
     scheduler_cosine = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=learning_rate * 0.01)
 
-    # Warmup scheduler: linearly increase LR over 'warmup_epochs'.
     def adjust_learning_rate(optimizer, epoch, warmup_epochs, base_lr):
         if epoch < warmup_epochs:
             lr = base_lr * float(epoch + 1) / warmup_epochs
@@ -152,7 +203,6 @@ def main():
         correct = 0
         total = 0
 
-        # Adjust LR during warmup; otherwise step the cosine scheduler.
         current_lr = adjust_learning_rate(optimizer, epoch, warmup_epochs, learning_rate)
         if current_lr is None and epoch >= warmup_epochs:
             scheduler_cosine.step()
@@ -161,13 +211,16 @@ def main():
         if rank == 0 and logger:
             logger.info(f"Epoch {epoch+1}/{epochs}, Learning Rate: {current_lr:.6f}")
 
-        # Training loop.
         for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]", disable=(rank != 0)):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
+            
+            # Apply mixup/cutmix if enabled.
+            if mixup_fn_inst is not None:
+                images, labels = mixup_fn_inst(images, labels)
+
             optimizer.zero_grad(set_to_none=True)
 
-            # Use a thread for the forward pass with checkpointing.
             output_container = []
             thread = threading.Thread(target=lambda: output_container.append(checkpointed_forward(images, model)))
             thread.start()
@@ -176,16 +229,22 @@ def main():
 
             loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
+
+            if ema is not None:
+                ema.update(model.module)
 
             bs = images.size(0)
             running_loss += loss.item() * bs
             _, preds = torch.max(outputs, 1)
-            correct += preds.eq(labels).sum().item()
+            # For mixup, we can't directly compute accuracy.
+            if mixup_fn_inst is None:
+                correct += preds.eq(labels).sum().item()
             total += bs
 
-        # Aggregate training metrics across GPUs.
         train_loss_tensor = torch.tensor(running_loss, device=device)
         train_total_tensor = torch.tensor(total, device=device)
         train_correct_tensor = torch.tensor(correct, device=device)
@@ -195,8 +254,9 @@ def main():
         epoch_train_loss = train_loss_tensor.item() / train_total_tensor.item()
         epoch_train_acc = train_correct_tensor.item() / train_total_tensor.item()
 
-        # Validation loop.
-        model.eval()
+        # Use EMA model for evaluation if available.
+        model_eval = ema.ema if ema is not None else model
+        model_eval.eval()
         val_loss = 0.0
         val_correct = 0
         val_total = 0
@@ -205,15 +265,14 @@ def main():
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
                 with autocast(device_type='cuda'):
-                    outputs = model(images)
-                loss = criterion(outputs, labels)
+                    outputs = model_eval(images)
+                loss = nn.CrossEntropyLoss()(outputs, labels)
                 bs = images.size(0)
                 val_loss += loss.item() * bs
                 _, preds = torch.max(outputs, 1)
                 val_correct += preds.eq(labels).sum().item()
                 val_total += bs
 
-        # Aggregate validation metrics.
         val_loss_tensor = torch.tensor(val_loss, device=device)
         val_total_tensor = torch.tensor(val_total, device=device)
         val_correct_tensor = torch.tensor(val_correct, device=device)
@@ -230,7 +289,6 @@ def main():
             if logger:
                 logger.info(log_line)
 
-            # Save the best model.
             if epoch_val_acc > best_val_acc:
                 best_val_acc = epoch_val_acc
                 torch.save(model.module.state_dict(), "best_model.pth")
@@ -239,7 +297,6 @@ def main():
         torch.cuda.empty_cache()
 
     dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     main()
