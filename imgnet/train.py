@@ -11,8 +11,6 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.checkpoint import checkpoint
 from torch.cuda.amp import autocast, GradScaler
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
 from tqdm import tqdm
 import threading
 import logging
@@ -22,6 +20,9 @@ from torch.distributed.optim import ZeroRedundancyOptimizer
 
 # Use timm's mixup implementation.
 import timm.data.mixup as mixup_fn_lib
+
+# Import timm's transform creator.
+from timm.data import create_transform
 
 # Enable CuDNN benchmark for improved performance.
 torch.backends.cudnn.benchmark = True
@@ -63,7 +64,6 @@ def main():
     parser.add_argument('--use_ema', action='store_true', help="Enable EMA for model weights")
     parser.add_argument('--ema_decay', default=0.9998, type=float, help="EMA decay rate")
     parser.add_argument('--grad_clip', default=1.0, type=float, help="Max norm for gradient clipping")
-    # New arguments for dropout and drop path.
     parser.add_argument('--drop_rate', default=0.0, type=float, help="Dropout rate")
     parser.add_argument('--drop_path_rate', default=0.1, type=float, help="Drop path (stochastic depth) rate")
     args = parser.parse_args()
@@ -92,31 +92,40 @@ def main():
     epochs = 300
     learning_rate = 7e-4
     weight_decay = 0.05
-    label_smoothing = 0.1
+    # When using cutmix, we disable label smoothing by default.
+    label_smoothing = 0.0  
     warmup_epochs = 10
 
-    # Data augmentation pipeline (inspired by DeiT) with additional augmentations.
-    transform_train = transforms.Compose([
-        transforms.RandomResizedCrop(224),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
-        transforms.RandomGrayscale(p=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406],
-                             [0.229, 0.224, 0.225]),
-        transforms.RandomErasing(p=0.25, scale=(0.02, 0.33), ratio=(0.3, 3.3), value='random')
-    ])
-    transform_val = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406],
-                             [0.229, 0.224, 0.225])
-    ])
+    # Use timm's standardized transforms.
+    # For training, we include auto-augmentation (and repeated augmentation if desired)
+    transform_train = create_transform(
+        input_size=224,
+        is_training=True,
+        color_jitter=0.4,
+        auto_augment='rand-m9-mstd0.5',  # Adjust as needed.
+        interpolation='bicubic',
+        re_prob=0.25,  # random erasing probability
+        re_mode='pixel',
+        re_count=1,
+    )
+    # For evaluation, we resize directly to the crop dimension (224) to avoid bias.
+    transform_val = create_transform(
+        input_size=224,
+        is_training=False,
+        interpolation='bicubic',
+    )
 
     # Datasets.
-    train_dataset = datasets.ImageNet(root="/data/jacob/ImageNet", split="train", transform=transform_train)
-    val_dataset = datasets.ImageNet(root="/data/jacob/ImageNet", split="val", transform=transform_val)
+    train_dataset = timm.data.datasets.ImageDataset(
+        root="/data/jacob/ImageNet",
+        split="train",
+        transform=transform_train
+    )
+    val_dataset = timm.data.datasets.ImageDataset(
+        root="/data/jacob/ImageNet",
+        split="val",
+        transform=transform_val
+    )
 
     # Distributed samplers.
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
@@ -144,12 +153,10 @@ def main():
 
     # Model creation and wrapping for distributed training.
     if args.model.lower() == 'fftnet_vit':
-        # Pass drop_rate and drop_path_rate to your custom model if supported.
         from fftnet_vit import FFTNetViT
         model = FFTNetViT(drop_rate=args.drop_rate, drop_path_rate=args.drop_path_rate).to(device)
     else:
         import timm
-        # timm models (like DeiT) accept drop_rate and drop_path_rate arguments.
         model = timm.create_model(
             args.model,
             pretrained=False,
@@ -193,7 +200,9 @@ def main():
     )
 
     # Cosine annealing scheduler (post-warmup).
-    scheduler_cosine = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=learning_rate * 0.01)
+    scheduler_cosine = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs - warmup_epochs, eta_min=learning_rate * 0.01
+    )
 
     def adjust_learning_rate(optimizer, epoch, warmup_epochs, base_lr):
         if epoch < warmup_epochs:
@@ -232,7 +241,9 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
             output_container = []
-            thread = threading.Thread(target=lambda: output_container.append(checkpointed_forward(images, model)))
+            thread = threading.Thread(
+                target=lambda: output_container.append(checkpointed_forward(images, model))
+            )
             thread.start()
             thread.join()
             outputs = output_container[0]
