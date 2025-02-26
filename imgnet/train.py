@@ -63,6 +63,9 @@ def main():
     parser.add_argument('--use_ema', action='store_true', help="Enable EMA for model weights")
     parser.add_argument('--ema_decay', default=0.9998, type=float, help="EMA decay rate")
     parser.add_argument('--grad_clip', default=1.0, type=float, help="Max norm for gradient clipping")
+    # New arguments for dropout and drop path.
+    parser.add_argument('--drop_rate', default=0.0, type=float, help="Dropout rate")
+    parser.add_argument('--drop_path_rate', default=0.1, type=float, help="Drop path (stochastic depth) rate")
     args = parser.parse_args()
 
     # Distributed training setup.
@@ -141,11 +144,19 @@ def main():
 
     # Model creation and wrapping for distributed training.
     if args.model.lower() == 'fftnet_vit':
+        # Pass drop_rate and drop_path_rate to your custom model if supported.
         from fftnet_vit import FFTNetViT
-        model = FFTNetViT().to(device)
+        model = FFTNetViT(drop_rate=args.drop_rate, drop_path_rate=args.drop_path_rate).to(device)
     else:
         import timm
-        model = timm.create_model(args.model, pretrained=False, num_classes=1000).to(device)
+        # timm models (like DeiT) accept drop_rate and drop_path_rate arguments.
+        model = timm.create_model(
+            args.model,
+            pretrained=False,
+            num_classes=1000,
+            drop_rate=args.drop_rate,
+            drop_path_rate=args.drop_path_rate
+        ).to(device)
     model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
 
     # Initialize EMA if enabled.
@@ -168,7 +179,6 @@ def main():
             num_classes=1000)
 
     # Loss function.
-    # If mixup is enabled, use soft cross entropy; otherwise, standard CE loss.
     if mixup_fn_inst is not None:
         criterion = soft_cross_entropy
     else:
@@ -240,7 +250,6 @@ def main():
             bs = images.size(0)
             running_loss += loss.item() * bs
             _, preds = torch.max(outputs, 1)
-            # For mixup, we can't directly compute accuracy.
             if mixup_fn_inst is None:
                 correct += preds.eq(labels).sum().item()
             total += bs
