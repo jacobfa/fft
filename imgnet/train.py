@@ -21,8 +21,9 @@ from torch.distributed.optim import ZeroRedundancyOptimizer
 # Use timm's mixup implementation.
 import timm.data.mixup as mixup_fn_lib
 
-# Import timm's transform creator.
-from timm.data import create_transform
+# Use torchvision transforms and datasets.
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
 
 # Enable CuDNN benchmark for improved performance.
 torch.backends.cudnn.benchmark = True
@@ -96,36 +97,37 @@ def main():
     label_smoothing = 0.0  
     warmup_epochs = 10
 
-    # Use timm's standardized transforms.
-    # For training, we include auto-augmentation (and repeated augmentation if desired)
-    transform_train = create_transform(
-        input_size=224,
-        is_training=True,
-        color_jitter=0.4,
-        auto_augment='rand-m9-mstd0.5',  # Adjust as needed.
-        interpolation='bicubic',
-        re_prob=0.25,  # random erasing probability
-        re_mode='pixel',
-        re_count=1,
-    )
-    # For evaluation, we resize directly to the crop dimension (224) to avoid bias.
-    transform_val = create_transform(
-        input_size=224,
-        is_training=False,
-        interpolation='bicubic',
-    )
+    # -----------------------
+    # Define Transform Pipelines using torchvision.
+    # -----------------------
 
-    # Datasets.
-    train_dataset = timm.data.datasets.ImageDataset(
-        root="/data/jacob/ImageNet",
-        split="train",
-        transform=transform_train
-    )
-    val_dataset = timm.data.datasets.ImageDataset(
-        root="/data/jacob/ImageNet",
-        split="val",
-        transform=transform_val
-    )
+    # Training augmentations.
+    transform_train = transforms.Compose([
+        # Randomly crop the image to 224×224 from a resized version.
+        transforms.RandomResizedCrop(224, scale=(0.08, 1.0), ratio=(3/4, 4/3)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+        transforms.AutoAugment(policy=transforms.AutoAugmentPolicy.IMAGENET),
+        transforms.RandomRotation(15),
+        transforms.RandomPerspective(distortion_scale=0.5, p=0.5),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.33), ratio=(0.3, 3.3), value='random')
+    ])
+
+    # Evaluation transforms: resize directly to 224×224 to avoid any center bias.
+    transform_val = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+
+    # Datasets using torchvision.datasets.ImageNet.
+    train_dataset = datasets.ImageNet(root="/data/jacob/ImageNet", split="train", transform=transform_train)
+    val_dataset = datasets.ImageNet(root="/data/jacob/ImageNet", split="val", transform=transform_val)
 
     # Distributed samplers.
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
