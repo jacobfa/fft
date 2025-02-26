@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 import os
-# Set environment variable to help mitigate memory fragmentation.
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
@@ -9,12 +8,13 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.checkpoint import checkpoint
-from torch.amp import autocast, GradScaler
+from torch.cuda.amp import autocast, GradScaler
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 from fftnet_vit import FFTNetViT  # Ensure FFTNetViT is defined appropriately.
 from tqdm import tqdm
 import threading
+import logging
 
 # Use ZeroRedundancyOptimizer to offload optimizer state to CPU.
 from torch.distributed.optim import ZeroRedundancyOptimizer
@@ -22,36 +22,50 @@ from torch.distributed.optim import ZeroRedundancyOptimizer
 # Enable CuDNN benchmark for improved performance.
 torch.backends.cudnn.benchmark = True
 
+
 def checkpointed_forward(x, model):
-    # Run the model's forward pass under mixed precision.
     with autocast(device_type='cuda'):
         return model(x)
 
+
 def main():
-    # Retrieve distributed training parameters from environment variables.
+    # Distributed training setup.
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    
-    # Set the GPU device for this process.
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-
-    # Initialize the distributed process group.
     dist.init_process_group(backend="nccl", init_method="env://")
+
+    # Setup logging (only on rank 0).
+    if rank == 0:
+        logging.basicConfig(level=logging.INFO,
+                            format='%(asctime)s - %(levelname)s - %(message)s',
+                            filename='training.log',
+                            filemode='w')
+        logger = logging.getLogger()
+        logger.info("Starting training")
+    else:
+        logger = None
 
     # Hyperparameters.
     batch_size = 128
     epochs = 300
     learning_rate = 7e-4
+    weight_decay = 0.05
+    label_smoothing = 0.1
+    warmup_epochs = 10
 
-    # Define ImageNet transforms.
+    # Data augmentation pipeline (inspired by DeiT) with additional augmentations.
     transform_train = transforms.Compose([
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),  # Random jitter.
+        transforms.RandomGrayscale(p=0.2),  # Convert image to grayscale with probability 0.2.
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406],
-                             [0.229, 0.224, 0.225])
+                             [0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.33), ratio=(0.3, 3.3), value='random')  # Random erasing.
     ])
     transform_val = transforms.Compose([
         transforms.Resize(256),
@@ -61,15 +75,15 @@ def main():
                              [0.229, 0.224, 0.225])
     ])
 
-    # Create ImageNet datasets.
+    # Datasets.
     train_dataset = datasets.ImageNet(root="/data/jacob/ImageNet", split="train", transform=transform_train)
     val_dataset = datasets.ImageNet(root="/data/jacob/ImageNet", split="val", transform=transform_val)
 
-    # Set up distributed samplers.
+    # Distributed samplers.
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
 
-    # DataLoaders using multiple worker processes, persistent workers, and prefetching.
+    # DataLoaders with persistent workers and prefetching.
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
@@ -89,36 +103,35 @@ def main():
         prefetch_factor=2
     )
 
-    # Create and wrap the model in DistributedDataParallel.
+    # Model creation and wrapping for distributed training.
     model = FFTNetViT().to(device)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+    model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
 
-    criterion = nn.CrossEntropyLoss().to(device)
+    # Cross-entropy loss with label smoothing.
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing).to(device)
     
-    # Use ZeroRedundancyOptimizer so that optimizer state is mostly stored on CPU.
+    # Use AdamW wrapped with ZeroRedundancyOptimizer.
     optimizer = ZeroRedundancyOptimizer(
         model.parameters(),
-        optimizer_class=optim.Adam,
-        lr=learning_rate
+        optimizer_class=optim.AdamW,
+        lr=learning_rate,
+        weight_decay=weight_decay
     )
-    
-    # Set up automatic mixed precision training.
+
+    # Cosine annealing scheduler (post-warmup).
+    scheduler_cosine = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=learning_rate * 0.01)
+
+    # Warmup scheduler: linearly increase LR over 'warmup_epochs'.
+    def adjust_learning_rate(optimizer, epoch, warmup_epochs, base_lr):
+        if epoch < warmup_epochs:
+            lr = base_lr * float(epoch + 1) / warmup_epochs
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+            return lr
+        return None
+
     scaler = GradScaler()
-
     best_val_acc = 0.0
-    log_file = None
-    if rank == 0:
-        log_file = open("log.txt", "w")
-        log_file.write("Epoch,Train Loss,Train Acc,Val Loss,Val Acc\n")
-        log_file.flush()
-
-    # Define a custom forward function for use with checkpointing.
-    def custom_forward(x):
-        return checkpointed_forward(x, model)
-
-    # Optionally offload the forward pass to a separate thread.
-    def threaded_forward(x, output_container):
-        output_container.append(custom_forward(x))
 
     for epoch in range(epochs):
         model.train()
@@ -127,17 +140,26 @@ def main():
         correct = 0
         total = 0
 
+        # Adjust LR during warmup; otherwise step the cosine scheduler.
+        current_lr = adjust_learning_rate(optimizer, epoch, warmup_epochs, learning_rate)
+        if current_lr is None and epoch >= warmup_epochs:
+            scheduler_cosine.step()
+            current_lr = optimizer.param_groups[0]['lr']
+
+        if rank == 0 and logger:
+            logger.info(f"Epoch {epoch+1}/{epochs}, Learning Rate: {current_lr:.6f}")
+
         # Training loop.
         for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]", disable=(rank != 0)):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
 
-            # Use a thread to run the forward pass.
+            # Use a thread for the forward pass with checkpointing.
             output_container = []
-            thread = threading.Thread(target=threaded_forward, args=(images, output_container))
+            thread = threading.Thread(target=lambda: output_container.append(checkpointed_forward(images, model)))
             thread.start()
-            thread.join()  # Wait for the forward pass to complete.
+            thread.join()
             outputs = output_container[0]
 
             loss = criterion(outputs, labels)
@@ -179,6 +201,7 @@ def main():
                 val_correct += preds.eq(labels).sum().item()
                 val_total += bs
 
+        # Aggregate validation metrics.
         val_loss_tensor = torch.tensor(val_loss, device=device)
         val_total_tensor = torch.tensor(val_total, device=device)
         val_correct_tensor = torch.tensor(val_correct, device=device)
@@ -189,23 +212,22 @@ def main():
         epoch_val_acc = val_correct_tensor.item() / val_total_tensor.item()
 
         if rank == 0:
-            log_line = f"{epoch+1},{epoch_train_loss:.4f},{epoch_train_acc:.4f},{epoch_val_loss:.4f},{epoch_val_acc:.4f}\n"
+            log_line = f"{epoch+1},{epoch_train_loss:.4f},{epoch_train_acc:.4f},{epoch_val_loss:.4f},{epoch_val_acc:.4f}"
             print(f"Epoch {epoch+1}/{epochs} - Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.4f}, "
                   f"Val Loss: {epoch_val_loss:.4f}, Val Acc: {epoch_val_acc:.4f}")
-            log_file.write(log_line)
-            log_file.flush()
+            if logger:
+                logger.info(log_line)
 
+            # Save the best model.
             if epoch_val_acc > best_val_acc:
                 best_val_acc = epoch_val_acc
                 torch.save(model.module.state_dict(), "best_model.pth")
-                print(f"Saved best model at epoch {epoch+1} with Val Acc: {epoch_val_acc:.4f}")
+                logger.info(f"Saved best model at epoch {epoch+1} with Val Acc: {epoch_val_acc:.4f}")
 
         torch.cuda.empty_cache()
 
-    if log_file is not None:
-        log_file.close()
-
     dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     main()
