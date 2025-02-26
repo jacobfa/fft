@@ -1,4 +1,3 @@
-# fftnet_vit.py
 import torch
 import torch.nn as nn
 from fftnet_modules import MultiHeadSpectralAttention, TransformerEncoderBlock
@@ -23,10 +22,11 @@ class PatchEmbed(nn.Module):
 class FFTNetViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000,
                  embed_dim=768, depth=12, mlp_ratio=4.0, dropout=0.1,
-                 num_heads=12, adaptive_spectral=True):
+                 num_heads=12, adaptive_spectral=True, drop_path_rate=0.0):
         """
         Vision Transformer with FFTNet (spectral) attention.
         Hyperparameters are set for ImageNet.
+        drop_path_rate: The maximum drop path rate (stochastic depth) across the network.
         """
         super().__init__()
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
@@ -37,14 +37,24 @@ class FFTNetViT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, n_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(dropout)
 
-        # Build Transformer encoder blocks with spectral attention
+        # Compute drop path rates for each block
+        if depth > 1:
+            dpr = [drop_path_rate * i / (depth - 1) for i in range(depth)]
+        else:
+            dpr = [drop_path_rate]
+
+        # Build Transformer encoder blocks with spectral attention and drop path.
         self.blocks = nn.ModuleList()
-        for _ in range(depth):
+        for i in range(depth):
             spectral_attn = MultiHeadSpectralAttention(
                 embed_dim, seq_len=n_patches + 1,
                 num_heads=num_heads, dropout=dropout, adaptive=adaptive_spectral
             )
-            block = TransformerEncoderBlock(embed_dim, mlp_ratio, dropout, attention_module=spectral_attn)
+            block = TransformerEncoderBlock(
+                embed_dim, mlp_ratio, dropout,
+                attention_module=spectral_attn,
+                drop_path=dpr[i]  # Pass the scheduled drop path rate
+            )
             self.blocks.append(block)
 
         self.norm = nn.LayerNorm(embed_dim)
