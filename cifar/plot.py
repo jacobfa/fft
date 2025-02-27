@@ -14,10 +14,9 @@ import pandas as pd
 import seaborn as sns
 import scienceplots
 
-# Use scienceplots styles for a publication-ready look.
 plt.style.use(["science", "ieee", "no-latex"])
 
-# Configure seaborn with a white style (no grid) and custom context.
+
 sns.set_theme(context="paper", style="white", font_scale=1.3)
 
 # Define custom colors (lighter blue and red) and markers for the models.
