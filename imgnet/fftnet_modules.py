@@ -1,6 +1,31 @@
 import torch
 import torch.nn as nn
 
+def drop_path(x, drop_prob: float = 0., training: bool = False):
+    """
+    Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
+    """
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    # Generate binary tensor mask; shape: (batch_size, 1, 1, ..., 1)
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()  # binarize
+    output = x.div(keep_prob) * random_tensor
+    return output
+
+class DropPath(nn.Module):
+    """
+    DropPath module that performs stochastic depth.
+    """
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
 class MultiHeadSpectralAttention(nn.Module):
     def __init__(self, embed_dim, seq_len, num_heads=4, dropout=0.1, adaptive=True):
         """
@@ -92,15 +117,15 @@ class MultiHeadSpectralAttention(nn.Module):
         # Residual connection with dropout and layer normalization.
         return self.norm(x + self.dropout(x_filtered))
 
-
 class TransformerEncoderBlock(nn.Module):
-    def __init__(self, embed_dim, mlp_ratio=4.0, dropout=0.1, attention_module=None):
+    def __init__(self, embed_dim, mlp_ratio=4.0, dropout=0.1, attention_module=None, drop_path=0.0):
         """
-        A generic Transformer encoder block.
+        A generic Transformer encoder block with integrated drop path (stochastic depth).
           - embed_dim: embedding dimension.
           - mlp_ratio: expansion factor for the MLP.
           - dropout: dropout rate.
           - attention_module: a module handling self-attention.
+          - drop_path: drop path rate for stochastic depth.
         """
         super().__init__()
         if attention_module is None:
@@ -114,8 +139,12 @@ class TransformerEncoderBlock(nn.Module):
             nn.Dropout(dropout)
         )
         self.norm = nn.LayerNorm(embed_dim)
+        # Drop path layer for stochastic depth
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x):
-        x = self.attention(x)
-        x = x + self.mlp(self.norm(x))
+        # Apply attention with drop path in the residual connection.
+        x = x + self.drop_path(self.attention(x))
+        # Apply MLP (after layer normalization) with drop path in the residual connection.
+        x = x + self.drop_path(self.mlp(self.norm(x)))
         return x
