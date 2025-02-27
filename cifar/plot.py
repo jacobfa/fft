@@ -6,9 +6,6 @@ This script reads the validation metrics saved in:
   - FFTNetsViT_val_metrics.txt
   - Transformer_val_metrics.txt
 
-It produces publication-ready plots using matplotlib with scienceplots 
-("science", "ieee", "no-latex") and a custom color palette without grid lines,
-then saves the plots as PNG files.
 """
 
 import os
