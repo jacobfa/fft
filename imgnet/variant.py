@@ -82,7 +82,7 @@ def plot_combined_latency_vs_batch_size(fftnet_variants, vit_variants, device):
         vit_variants: dictionary of standard ViT model configurations.
         device: torch device.
     """
-    batch_sizes = [1, 2, 4, 8, 16, 32]
+    batch_sizes = [1, 2, 4, 8, 16, 32, 64]
     plt.figure(figsize=(8, 6))
     
     # Define line and marker styles for each family.
