@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import os
+import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -52,6 +53,11 @@ def main():
                         help="Number of attention heads")
     parser.add_argument('--dropout', type=float, default=0.1,
                         help="Dropout rate")
+    # New arguments for training improvements.
+    parser.add_argument('--label_smoothing', type=float, default=0.1,
+                        help="Label smoothing value for CrossEntropyLoss")
+    parser.add_argument('--ema_decay', type=float, default=0.999,
+                        help="Exponential Moving Average decay rate")
     args = parser.parse_args()
     
     # Define a simple tokenizer function.
@@ -81,7 +87,6 @@ def main():
     if args.dataset == 'imdb':
         train_dataset = ImdbDataset(config, split='train')
         val_dataset = ImdbDataset(config, split='eval')
-        # For IMDB, tokens are scalars so input_dim remains 1.
         args.input_dim = 1
         args.seq_len = args.max_length
         args.num_classes = 2
@@ -91,7 +96,6 @@ def main():
         args.input_dim = 1
         args.seq_len = args.max_length
         args.num_classes = 10  # Correct the number of classes for ListOps.
-
     elif args.dataset == 'cifar10':
         train_dataset = Cifar10Dataset(config, split='train')
         val_dataset = Cifar10Dataset(config, split='eval')
@@ -146,9 +150,17 @@ def main():
     ).to(device)
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
 
-    criterion = nn.CrossEntropyLoss().to(device)
+    # Create loss with label smoothing.
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    # Cosine annealing scheduler.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     scaler = GradScaler()
+
+    # Create an EMA copy of the model (using the underlying module).
+    ema_model = copy.deepcopy(model.module)
+    for param in ema_model.parameters():
+        param.requires_grad = False
 
     best_val_acc = 0.0
     log_file = None
@@ -157,11 +169,9 @@ def main():
         log_file.write("Epoch,Train Loss,Train Acc,Val Loss,Val Acc\n")
         log_file.flush()
 
-    # Define a custom forward function (with optional checkpointing).
     def custom_forward(x):
         return checkpointed_forward(x, model)
 
-    # A helper function to offload the forward pass to a separate thread.
     def threaded_forward(x, output_container):
         output_container.append(custom_forward(x))
 
@@ -174,7 +184,6 @@ def main():
 
         # Training loop.
         for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]", disable=(rank != 0)):
-            # If the tokenizer returns a 2D tensor (B, seq_len), add a channel dimension.
             if inputs.dim() == 2:
                 inputs = inputs.unsqueeze(-1)  # (B, seq_len, 1)
             inputs = inputs.to(device, non_blocking=True)
@@ -192,6 +201,11 @@ def main():
             scaler.step(optimizer)
             scaler.update()
 
+            # Update EMA model.
+            with torch.no_grad():
+                for ema_param, param in zip(ema_model.parameters(), model.module.parameters()):
+                    ema_param.data.mul_(args.ema_decay).add_(param.data, alpha=1 - args.ema_decay)
+
             bs = inputs.size(0)
             running_loss += loss.item() * bs
             _, preds = torch.max(outputs, 1)
@@ -208,7 +222,7 @@ def main():
         epoch_train_loss = train_loss_tensor.item() / train_total_tensor.item()
         epoch_train_acc = train_correct_tensor.item() / train_total_tensor.item()
 
-        # Validation loop.
+        # Validation loop (using the regular model; you could also evaluate the EMA model if desired).
         model.eval()
         val_loss = 0.0
         val_correct = 0
@@ -247,10 +261,12 @@ def main():
 
             if epoch_val_acc > best_val_acc:
                 best_val_acc = epoch_val_acc
+                # Optionally, you could save the EMA model instead.
                 torch.save(model.module.state_dict(), "best_model.pth")
                 print(f"Saved best model at epoch {epoch+1} with Val Acc: {epoch_val_acc:.4f}")
 
-        # Optionally clear GPU cache.
+        # Update the learning rate using cosine annealing.
+        scheduler.step()
         torch.cuda.empty_cache()
 
     if log_file is not None:
