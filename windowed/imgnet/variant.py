@@ -136,7 +136,7 @@ def main():
         'FFTNetViT Base': {
             'img_size': 224,
             'patch_size': 16,
-            'in_chans': 3,
+            'in_channels': 3,
             'num_classes': 1000,
             'embed_dim': 768,
             'depth': 12,
@@ -148,7 +148,7 @@ def main():
         'FFTNetViT Large': {
             'img_size': 224,
             'patch_size': 16,
-            'in_chans': 3,
+            'in_channels': 3,
             'num_classes': 1000,
             'embed_dim': 1024,
             'depth': 24,
@@ -160,7 +160,7 @@ def main():
         'FFTNetViT Huge': {
             'img_size': 224,
             'patch_size': 16,
-            'in_chans': 3,
+            'in_channels': 3,
             'num_classes': 1000,
             'embed_dim': 1280,
             'depth': 32,
@@ -176,7 +176,7 @@ def main():
         'ViT Base': {
             'img_size': 224,
             'patch_size': 16,
-            'in_chans': 3,
+            'in_channels': 3,
             'num_classes': 1000,
             'embed_dim': 768,
             'depth': 12,
@@ -187,7 +187,7 @@ def main():
         'ViT Large': {
             'img_size': 224,
             'patch_size': 16,
-            'in_chans': 3,
+            'in_channels': 3,
             'num_classes': 1000,
             'embed_dim': 1024,
             'depth': 24,
@@ -198,7 +198,7 @@ def main():
         'ViT Huge': {
             'img_size': 224,
             'patch_size': 16,
-            'in_chans': 3,
+            'in_channels': 3,
             'num_classes': 1000,
             'embed_dim': 1280,
             'depth': 32,
