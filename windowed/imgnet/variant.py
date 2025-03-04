@@ -123,9 +123,9 @@ def plot_combined_latency_vs_batch_size(fftnet_variants, vit_variants, device):
     plt.title("Latency vs Batch Size: FFTNetViT vs Standard ViT")
     plt.legend()
     plt.grid(True)
-    plt.savefig("combined_latency_comparison.png")
+    plt.savefig("combined_latency_comparison.pdf")
     plt.close()
-    logger.info("Saved combined latency plot: combined_latency_comparison.png")
+    logger.info("Saved combined latency plot: combined_latency_comparison.pdf")
 
 def main():
     # Determine device: use GPU if available, else CPU.
