@@ -217,7 +217,7 @@ class MultiScaleSpectralAttention(nn.Module):
         )  # (B,H,#windows,win_size,D)
 
         # Reshape back
-        x_local_padded = x_local_win.view(B, H, total_len, D)
+        x_local_padded = x_local_win.reshape(B, H, total_len, D)
         # Remove padding
         if pad_len > 0:
             x_local = x_local_padded[:, :, :N, :]
