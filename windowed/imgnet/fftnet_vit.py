@@ -31,17 +31,17 @@ class FFTNetViT(nn.Module):
     """
     def __init__(
         self,
-        img_size=32,
-        patch_size=4,
+        img_size=224,            # ImageNet images are 224x224
+        patch_size=16,           # 16x16 patches → 14x14 patches + class token = 197 tokens
         in_chans=3,
-        num_classes=10,
-        embed_dim=192,
-        depth=6,
+        num_classes=1000,        # ImageNet has 1000 classes
+        embed_dim=768,           # ViT-Base setting
+        depth=12,                # 12 transformer encoder blocks
         mlp_ratio=4.0,
         dropout=0.1,
-        num_heads=3,
+        num_heads=12,            # 768/12 = 64 dims per head
         adaptive_spectral=True,
-        local_window_size=8,
+        local_window_size=8,     # Local STFT window size; adjust if needed
         use_local_branch=True
     ):
         """
