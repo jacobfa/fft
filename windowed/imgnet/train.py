@@ -119,7 +119,7 @@ def main():
     # Hyperparameters.
     batch_size = 16
     epochs = 300
-    learning_rate = 7e-4
+    learning_rate = 4e-3
     weight_decay = 0.05
     label_smoothing = 0.0  
     warmup_epochs = 10
