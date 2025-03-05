@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 def drop_path(x, drop_prob: float = 0., training: bool = False):
     """
     Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
@@ -14,6 +15,7 @@ def drop_path(x, drop_prob: float = 0., training: bool = False):
     random_tensor.floor_()  # binarize
     output = x.div(keep_prob) * random_tensor
     return output
+
 
 class DropPath(nn.Module):
     """
@@ -31,8 +33,8 @@ class MultiScaleSpectralAttention(nn.Module):
     """
     Multi-scale spectral attention module with:
       1) Global FFT over the entire sequence.
-      2) Local STFT (windowed FFT).
-      3) A gating mechanism to fuse global and local branches.
+      2) Local STFT (windowed FFT) with Hann windowing.
+      3) A learned gating MLP to fuse global and local branches.
     """
     def __init__(
         self,
@@ -87,6 +89,12 @@ class MultiScaleSpectralAttention(nn.Module):
             self.base_bias_local = nn.Parameter(
                 torch.full((num_heads, self.freq_bins_local, 1), -0.1)
             )
+            
+            # Register a Hann window buffer (not a Parameter) for local windowing
+            hann = torch.hann_window(local_window_size, periodic=False)  # shape: (local_window_size,)
+            # Reshape to broadcast easily to (B, H, #windows, local_window_size, D)
+            hann = hann.view(1, 1, 1, local_window_size, 1)
+            self.register_buffer("hann_window", hann)
         else:
             self.freq_bins_local = None
 
@@ -110,8 +118,17 @@ class MultiScaleSpectralAttention(nn.Module):
         # Pre-normalization for stability
         self.pre_norm = nn.LayerNorm(embed_dim)
 
-        # Gating parameter to fuse global/local
-        self.gate = nn.Parameter(torch.zeros(1))  # scalar
+        # Instead of a single scalar gate, we'll learn a gating MLP that
+        # outputs one alpha per head, per batch sample, in [0,1].
+        # We'll fuse local and global as: alpha * global + (1 - alpha) * local
+        if use_local_branch:
+            self.fusion_mlp = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim // 2),
+                nn.GELU(),
+                nn.Linear(embed_dim // 2, num_heads)  # outputs B x H
+            )
+        else:
+            self.fusion_mlp = None
 
     def complex_activation(self, z):
         """
@@ -142,7 +159,7 @@ class MultiScaleSpectralAttention(nn.Module):
 
         # base_filter_global: (H, freq_bins_global, 1)
         # We rely on broadcasting to match (B,H,freq_bins_global,D).
-        effective_filter = self.base_filter_global * (1 + adaptive_scale)  # still (B,H,freq_bins_global,1) after broadcast
+        effective_filter = self.base_filter_global * (1 + adaptive_scale) 
         effective_bias   = self.base_bias_global + adaptive_bias
 
         # Multiply & add in frequency domain
@@ -157,6 +174,7 @@ class MultiScaleSpectralAttention(nn.Module):
     def _transform_local(self, x_heads, adapt_params_local):
         """
         Perform local STFT in windows of size local_window_size.
+        Hann-window each local segment before FFT.
         x_heads shape: (B, H, N, D)
         """
         B, H, N, D = x_heads.shape
@@ -175,16 +193,20 @@ class MultiScaleSpectralAttention(nn.Module):
 
         # Reshape to (B, H, #windows, win_size, D)
         x_heads_win = x_heads_padded.view(B, H, num_windows, win_size, D)
-        # Local FFT over dim=3
-        F_fft_local = torch.fft.rfft(x_heads_win, dim=3, norm='ortho')  
+
+        # Multiply by the registered Hann window (broadcast)
+        # hann_window shape: (1,1,1,win_size,1) => broadcast
+        x_heads_win = x_heads_win * self.hann_window
+
+        # Local FFT over dim=3 (the window dimension)
+        F_fft_local = torch.fft.rfft(x_heads_win, dim=3, norm='ortho')
         # shape: (B, H, #windows, freq_bins_local, D)
 
         # Expand adapt_params_local to match #windows
         if self.adaptive and adapt_params_local is not None:
-            # (B, H, freq_bins_local, 2) -> unsqueeze #windows dimension
+            # adapt_params_local: (B, H, freq_bins_local, 2)
             adaptive_scale = adapt_params_local[..., 0:1]  # (B,H,freq_bins_local,1)
             adaptive_bias  = adapt_params_local[..., 1:2]  # (B,H,freq_bins_local,1)
-
             # Expand across #windows dimension
             adaptive_scale = adaptive_scale.unsqueeze(2).expand(-1, -1, num_windows, -1, -1)
             adaptive_bias  = adaptive_bias.unsqueeze(2).expand(-1, -1, num_windows, -1, -1)
@@ -196,17 +218,15 @@ class MultiScaleSpectralAttention(nn.Module):
             adaptive_bias = torch.zeros_like(adaptive_scale)
 
         # base_filter_local: (H, freq_bins_local, 1)
-        # To broadcast with (B,H,#windows,freq_bins_local,D), we unsqueeze to (1,H,1,freq_bins_local,1).
-        base_filter_local = self.base_filter_local.unsqueeze(0).unsqueeze(2)
+        # -> broadcast with (B,H,#windows,freq_bins_local,D)
+        base_filter_local = self.base_filter_local.unsqueeze(0).unsqueeze(2)  # (1,H,1,freq_bins_local,1)
         base_bias_local   = self.base_bias_local.unsqueeze(0).unsqueeze(2)
-        # Now shape: (1, H, 1, freq_bins_local, 1)
 
         # Combine base + adaptive
         effective_filter_local = base_filter_local * (1 + adaptive_scale)
         effective_bias_local   = base_bias_local + adaptive_bias
 
         # Multiply and add
-        # F_fft_local: (B,H,#windows,freq_bins_local,D)
         F_fft_local_mod = F_fft_local * effective_filter_local + effective_bias_local
         # Nonlinear activation
         F_fft_local_nl = self.complex_activation(F_fft_local_mod)
@@ -234,10 +254,10 @@ class MultiScaleSpectralAttention(nn.Module):
         B, N, D = x.shape
         # Normalize
         x_norm = self.pre_norm(x)
-        # Reshape into heads
+        # Reshape into heads => (B,H,N,head_dim)
         x_heads = x_norm.view(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        # Context for adaptive MLPs
+        # Context for adaptive MLPs and gating
         context = x_norm.mean(dim=1)  # (B, embed_dim)
 
         # Global adapt
@@ -249,9 +269,10 @@ class MultiScaleSpectralAttention(nn.Module):
         else:
             adapt_params_global = None
 
+        # Global branch
         x_global = self._transform_global(x_heads, adapt_params_global)
 
-        # Local adapt (optional)
+        # Local branch (optional)
         if self.use_local_branch:
             if self.adaptive:
                 adapt_params_local = self.adaptive_mlp_local(context)
@@ -263,8 +284,13 @@ class MultiScaleSpectralAttention(nn.Module):
 
             x_local = self._transform_local(x_heads, adapt_params_local)
 
-            # Fuse
-            alpha = torch.sigmoid(self.gate)  # scalar in [0,1]
+            # --- Learn an adaptive gating alpha for each head ---
+            # gating MLP -> shape (B, num_heads)
+            alpha = self.fusion_mlp(context)  # (B, num_heads)
+            alpha = torch.sigmoid(alpha)      # ensure in [0,1]
+
+            # Reshape to broadcast in (B,H,N,head_dim)
+            alpha = alpha.view(B, self.num_heads, 1, 1)
             x_fused_heads = alpha * x_global + (1.0 - alpha) * x_local
         else:
             x_fused_heads = x_global
