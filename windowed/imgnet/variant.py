@@ -76,11 +76,6 @@ def plot_combined_latency_vs_batch_size(fftnet_variants, vit_variants, device):
     Plots average inference latency versus batch size for corresponding FFTNetViT and standard ViT variants.
     Each variant type (Base, Large, Huge) is compared directly by using the same color across families, while
     different line styles and markers differentiate the model family.
-    
-    Parameters:
-        fftnet_variants: dictionary of FFTNetViT model configurations.
-        vit_variants: dictionary of standard ViT model configurations.
-        device: torch device.
     """
     batch_sizes = [1, 2, 4, 8, 16, 32, 64]
     plt.figure(figsize=(8, 6))
@@ -131,43 +126,49 @@ def main():
     # Determine device: use GPU if available, else CPU.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # FFTNetViT Variants configurations.
+    # FFTNetViT Variants configurations (all with local windowing).
     fftnet_variants = {
         'FFTNetViT Base': {
             'img_size': 224,
             'patch_size': 16,
-            'in_channels': 3,
+            'in_chans': 3,
             'num_classes': 1000,
             'embed_dim': 768,
             'depth': 12,
             'mlp_ratio': 4.0,
             'dropout': 0.1,
             'num_heads': 12,
-            'adaptive_spectral': True
+            'adaptive_spectral': True,
+            'local_window_size': 32,
+            'use_local_branch': True
         },
         'FFTNetViT Large': {
             'img_size': 224,
             'patch_size': 16,
-            'in_channels': 3,
+            'in_chans': 3,
             'num_classes': 1000,
             'embed_dim': 1024,
             'depth': 24,
             'mlp_ratio': 4.0,
             'dropout': 0.1,
             'num_heads': 16,
-            'adaptive_spectral': True
+            'adaptive_spectral': True,
+            'local_window_size': 32,
+            'use_local_branch': True
         },
         'FFTNetViT Huge': {
             'img_size': 224,
             'patch_size': 16,
-            'in_channels': 3,
+            'in_chans': 3,
             'num_classes': 1000,
             'embed_dim': 1280,
             'depth': 32,
             'mlp_ratio': 4.0,
             'dropout': 0.1,
             'num_heads': 16,
-            'adaptive_spectral': True
+            'adaptive_spectral': True,
+            'local_window_size': 32,
+            'use_local_branch': True
         }
     }
     
