@@ -28,15 +28,15 @@ class FFTNetViT(nn.Module):
     """
     def __init__(
         self,
-        img_size=32,
-        patch_size=4,
+        img_size=224,
+        patch_size=16,
         in_chans=3,
-        num_classes=10,
-        embed_dim=192,
+        num_classes=1000,
+        embed_dim=768,
         depth=12,
         mlp_ratio=4.0,
         dropout=0.1,
-        num_heads=4,
+        num_heads=12,
         adaptive_spectral=True,
         local_window_size=8,
         use_local_branch=True
