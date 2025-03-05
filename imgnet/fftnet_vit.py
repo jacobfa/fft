@@ -1,59 +1,90 @@
-# fftnet_vit.py
 import torch
 import torch.nn as nn
-from fftnet_modules import MultiHeadSpectralAttention, TransformerEncoderBlock
+from fftnet_modules import MultiScaleSpectralAttention, TransformerEncoderBlock
 
 class PatchEmbed(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
-        """
-        Splits the image into patches and projects them into an embedding space.
-        """
+    def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=192):
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
+        # total number of patches
         self.n_patches = (img_size // patch_size) ** 2
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.proj = nn.Conv2d(
+            in_chans, embed_dim,
+            kernel_size=patch_size, stride=patch_size
+        )
 
     def forward(self, x):
         # x: (B, C, H, W)
-        x = self.proj(x)  # (B, embed_dim, H/patch_size, W/patch_size)
-        x = x.flatten(2).transpose(1, 2)  # (B, n_patches, embed_dim)
+        x = self.proj(x)  
+        # Flatten spatial dims and transpose to (B, n_patches, embed_dim)
+        x = x.flatten(2).transpose(1, 2)  
         return x
 
+
 class FFTNetViT(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000,
-                 embed_dim=768, depth=12, mlp_ratio=4.0, dropout=0.1,
-                 num_heads=12, adaptive_spectral=True):
-        """
-        Vision Transformer with FFTNet (spectral) attention.
-        Hyperparameters are set for ImageNet.
-        """
+    """
+    Vision Transformer for e.g. CIFAR-10 or ImageNet, using multi-scale FFT-based attention.
+    """
+    def __init__(
+        self,
+        img_size=32,
+        patch_size=4,
+        in_chans=3,
+        num_classes=10,
+        embed_dim=192,
+        depth=12,
+        mlp_ratio=4.0,
+        dropout=0.1,
+        num_heads=4,
+        adaptive_spectral=True,
+        local_window_size=8,
+        use_local_branch=True
+    ):
         super().__init__()
-        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        self.patch_embed = PatchEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim
+        )
         n_patches = self.patch_embed.n_patches
 
-        # Learnable class token and positional embeddings
+        # Class token + positional embeddings
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, n_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(dropout)
 
-        # Build Transformer encoder blocks with spectral attention
+        # Build Transformer encoder blocks
         self.blocks = nn.ModuleList()
         for _ in range(depth):
-            spectral_attn = MultiHeadSpectralAttention(
-                embed_dim, seq_len=n_patches + 1,
-                num_heads=num_heads, dropout=dropout, adaptive=adaptive_spectral
+            spectral_attn = MultiScaleSpectralAttention(
+                embed_dim=embed_dim,
+                seq_len=n_patches + 1,  # #tokens = n_patches + 1 cls token
+                num_heads=num_heads,
+                dropout=dropout,
+                adaptive=adaptive_spectral,
+                local_window_size=local_window_size,
+                use_local_branch=use_local_branch,
             )
-            block = TransformerEncoderBlock(embed_dim, mlp_ratio, dropout, attention_module=spectral_attn)
+            block = TransformerEncoderBlock(
+                embed_dim=embed_dim,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+                attention_module=spectral_attn
+            )
             self.blocks.append(block)
 
         self.norm = nn.LayerNorm(embed_dim)
         self.head = nn.Linear(embed_dim, num_classes)
+
         self._init_weights()
 
     def _init_weights(self):
+        # Initialize embeddings
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
+        # Initialize linear layers
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -61,18 +92,26 @@ class FFTNetViT(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        # x: (B, C, H, W)
-        x = self.patch_embed(x)
+        # x: (B, 3, 32, 32)
+        x = self.patch_embed(x)  # (B, n_patches, embed_dim)
         B = x.shape[0]
-        # Expand the class token to the batch size and concatenate with patch tokens
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
+
+        # Class token
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B,1,embed_dim)
+        x = torch.cat((cls_tokens, x), dim=1)          # (B,n_patches+1,embed_dim)
+
+        # Add positional embedding
         x = x + self.pos_embed
         x = self.pos_drop(x)
 
-        for block in self.blocks:
-            x = block(x)
+        # Transformer
+        for blk in self.blocks:
+            x = blk(x)
+
+        # Final norm
         x = self.norm(x)
-        cls_out = x[:, 0]
-        out = self.head(cls_out)
+        cls_out = x[:, 0]  # (B, embed_dim)
+
+        # Classification head
+        out = self.head(cls_out)  # (B, num_classes)
         return out
