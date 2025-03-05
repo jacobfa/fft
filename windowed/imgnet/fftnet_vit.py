@@ -24,7 +24,7 @@ class PatchEmbed(nn.Module):
 
 class FFTNetViT(nn.Module):
     """
-    Vision Transformer for e.g. CIFAR-10 or ImageNet, using multi-scale FFT-based attention.
+    Vision Transformer using multi-scale FFT-based attention (both global and local STFT).
     """
     def __init__(
         self,
@@ -38,8 +38,9 @@ class FFTNetViT(nn.Module):
         dropout=0.1,
         num_heads=12,
         adaptive_spectral=True,
-        local_window_size=8,
-        use_local_branch=True
+        local_window_size=32,
+        use_local_branch=True,
+        use_global_hann=True
     ):
         super().__init__()
         self.patch_embed = PatchEmbed(
@@ -60,12 +61,13 @@ class FFTNetViT(nn.Module):
         for _ in range(depth):
             spectral_attn = MultiScaleSpectralAttention(
                 embed_dim=embed_dim,
-                seq_len=n_patches + 1,  # #tokens = n_patches + 1 cls token
+                seq_len=n_patches + 1,  # #tokens = n_patches + 1 (includes cls token)
                 num_heads=num_heads,
                 dropout=dropout,
                 adaptive=adaptive_spectral,
                 local_window_size=local_window_size,
                 use_local_branch=use_local_branch,
+                use_global_hann=use_global_hann
             )
             block = TransformerEncoderBlock(
                 embed_dim=embed_dim,
@@ -104,7 +106,7 @@ class FFTNetViT(nn.Module):
         x = x + self.pos_embed
         x = self.pos_drop(x)
 
-        # Transformer
+        # Transformer blocks
         for blk in self.blocks:
             x = blk(x)
 
