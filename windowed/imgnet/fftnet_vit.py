@@ -4,9 +4,6 @@ from fftnet_modules import MultiScaleSpectralAttention, TransformerEncoderBlock
 
 class PatchEmbed(nn.Module):
     def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=192):
-        """
-        For CIFAR-10, use img_size=32, patch_size=4 -> 8x8=64 patches + 1 class token = 65 tokens.
-        """
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
@@ -44,14 +41,6 @@ class FFTNetViT(nn.Module):
         local_window_size=8,     # Local STFT window size; adjust if needed
         use_local_branch=True
     ):
-        """
-        Default config for CIFAR-10:
-          - 32×32 images
-          - Patch size 4 => 8×8 = 64 patches
-          - +1 for class token => sequence length = 65
-          - embed_dim=192, num_heads=3 => 64 dims per head
-          - depth=6 => fewer blocks for speed
-        """
         super().__init__()
         self.patch_embed = PatchEmbed(
             img_size=img_size,
