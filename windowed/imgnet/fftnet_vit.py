@@ -15,30 +15,30 @@ class PatchEmbed(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, C, H=32, W=32)
-        x = self.proj(x)  # -> (B, embed_dim, H/patch_size, W/patch_size)
+        # x: (B, C, H, W)
+        x = self.proj(x)  
         # Flatten spatial dims and transpose to (B, n_patches, embed_dim)
-        x = x.flatten(2).transpose(1, 2)
+        x = x.flatten(2).transpose(1, 2)  
         return x
 
 
 class FFTNetViT(nn.Module):
     """
-    Vision Transformer for CIFAR-10, using multi-scale FFT-based attention.
+    Vision Transformer for e.g. CIFAR-10 or ImageNet, using multi-scale FFT-based attention.
     """
     def __init__(
         self,
-        img_size=224,            # ImageNet images are 224x224
-        patch_size=16,           # 16x16 patches → 14x14 patches + class token = 197 tokens
+        img_size=32,
+        patch_size=4,
         in_chans=3,
-        num_classes=1000,        # ImageNet has 1000 classes
-        embed_dim=768,           # ViT-Base setting
-        depth=12,                # 12 transformer encoder blocks
+        num_classes=10,
+        embed_dim=192,
+        depth=12,
         mlp_ratio=4.0,
         dropout=0.1,
-        num_heads=12,            # 768/12 = 64 dims per head
+        num_heads=4,
         adaptive_spectral=True,
-        local_window_size=8,     # Local STFT window size; adjust if needed
+        local_window_size=8,
         use_local_branch=True
     ):
         super().__init__()
@@ -48,11 +48,11 @@ class FFTNetViT(nn.Module):
             in_chans=in_chans,
             embed_dim=embed_dim
         )
-        n_patches = self.patch_embed.n_patches  # 64
+        n_patches = self.patch_embed.n_patches
 
         # Class token + positional embeddings
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, n_patches + 1, embed_dim))  # shape (1, 65, D)
+        self.pos_embed = nn.Parameter(torch.zeros(1, n_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(dropout)
 
         # Build Transformer encoder blocks
@@ -60,7 +60,7 @@ class FFTNetViT(nn.Module):
         for _ in range(depth):
             spectral_attn = MultiScaleSpectralAttention(
                 embed_dim=embed_dim,
-                seq_len=n_patches + 1,  # 64 + 1 = 65
+                seq_len=n_patches + 1,  # #tokens = n_patches + 1 cls token
                 num_heads=num_heads,
                 dropout=dropout,
                 adaptive=adaptive_spectral,
@@ -93,12 +93,12 @@ class FFTNetViT(nn.Module):
 
     def forward(self, x):
         # x: (B, 3, 32, 32)
-        x = self.patch_embed(x)  # (B, 64, embed_dim)
+        x = self.patch_embed(x)  # (B, n_patches, embed_dim)
         B = x.shape[0]
 
         # Class token
         cls_tokens = self.cls_token.expand(B, -1, -1)  # (B,1,embed_dim)
-        x = torch.cat((cls_tokens, x), dim=1)          # (B,65,embed_dim)
+        x = torch.cat((cls_tokens, x), dim=1)          # (B,n_patches+1,embed_dim)
 
         # Add positional embedding
         x = x + self.pos_embed
