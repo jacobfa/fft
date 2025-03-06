@@ -41,7 +41,7 @@ def main():
                         help="Batch size per GPU")
     parser.add_argument('--epochs', type=int, default=100,
                         help="Number of training epochs")
-    parser.add_argument('--learning_rate', type=float, default=5e-4,
+    parser.add_argument('--learning_rate', type=float, default=1e-4,
                         help="Learning rate")
     parser.add_argument('--depth', type=int, default=6,
                         help="Transformer depth")
