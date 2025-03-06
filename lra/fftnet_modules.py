@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class MultiHeadSpectralAttention(nn.Module):
     def __init__(self, embed_dim, seq_len, num_heads=4, dropout=0.1, adaptive=True):
@@ -49,7 +50,7 @@ class MultiHeadSpectralAttention(nn.Module):
         # Clamp the magnitude to avoid division by very small numbers.
         z_abs_clamped = torch.clamp(z_abs, min=1e-3)
         # Compute the activated magnitude: ReLU(|z| + bias)
-        activated = torch.gelu(z_abs + bias)
+        activated = F.gelu(z_abs + bias)
         # Compute scale safely.
         scale = activated / z_abs_clamped
         return z * scale
