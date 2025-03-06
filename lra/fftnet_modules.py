@@ -49,7 +49,7 @@ class MultiHeadSpectralAttention(nn.Module):
         # Clamp the magnitude to avoid division by very small numbers.
         z_abs_clamped = torch.clamp(z_abs, min=1e-3)
         # Compute the activated magnitude: ReLU(|z| + bias)
-        activated = torch.relu(z_abs + bias)
+        activated = torch.gelu(z_abs + bias)
         # Compute scale safely.
         scale = activated / z_abs_clamped
         return z * scale
