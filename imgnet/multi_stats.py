@@ -31,6 +31,16 @@ vit_style = {
     "linewidth": 2,
     "color": variant_colors["Large"]  # assign bright green for ViT
 }
+
+# If you need more distinct colors (for multiple image sizes), you can expand:
+image_size_colors = {
+    32:  "#F8961E",  # orange
+    64:  "#F9844A",  # peach
+    128: "#277DA1",  # azure
+    224: "#90BE6D",  # green
+    256: "#F94144",  # red
+    512: "#9B5DE5",  # purple
+}
 # ---------------------------------------------------------------------
 
 from fftnet_vit import FFTNetViT
@@ -40,16 +50,22 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 ##############################################################################
-# 1) Model Creation: We'll just define 'Base' config for both FFTNetViT & ViT
+# 1) Model Creation (Adjusted to accept dynamic img_size)
 ##############################################################################
-def create_model(model_name):
+def create_model(model_name, img_size=224):
     """
+    Dynamically instantiate the FFTNetViT or ViT model with the given image size.
+    
+    Args:
+        model_name (str): "FFTNetViT" or "ViT"
+        img_size (int):   e.g. 32 for CIFAR-10, 224 for ImageNet, etc.
+
     Returns:
         model (nn.Module): The instantiated PyTorch model
         desc  (str): A short descriptive string for logging
     """
     fftnet_config = {
-        'img_size': 224,
+        'img_size': img_size,
         'patch_size': 16,
         'in_chans': 3,
         'num_classes': 1000,
@@ -61,7 +77,7 @@ def create_model(model_name):
         'adaptive_spectral': True
     }
     vit_config = {
-        'img_size': 224,
+        'img_size': img_size,
         'patch_size': 16,
         'in_chans': 3,
         'num_classes': 1000,
@@ -72,9 +88,9 @@ def create_model(model_name):
         'num_heads': 12
     }
     if model_name == "FFTNetViT":
-        return FFTNetViT(**fftnet_config), "FFTNetViT (Base)"
+        return FFTNetViT(**fftnet_config), f"FFTNetViT (img_size={img_size})"
     elif model_name == "ViT":
-        return ViT(**vit_config), "ViT (Base)"
+        return ViT(**vit_config), f"ViT (img_size={img_size})"
     else:
         raise ValueError(f"Unknown model name: {model_name}")
 
@@ -118,20 +134,21 @@ def measure_latency(model, input_tensor, num_runs=10, warmup=3):
     return timings
 
 def ddp_worker(
-    rank, world_size, model_name, global_batch_size, num_runs, warmup, return_dict
+    rank, world_size, model_name, img_size, global_batch_size, num_runs, warmup, return_dict
 ):
     """
     The function that each process will run under mp.spawn for DDP.
     - rank: process rank (0 to world_size - 1)
     - world_size: total number of GPUs
     - model_name: "FFTNetViT" or "ViT"
+    - img_size: e.g., 32 for CIFAR or 224 for ImageNet
     - global_batch_size: the sum of the local batch sizes across all GPUs
     - return_dict: a multiprocessing dict to store final results in rank 0
     """
     ddp_setup(rank, world_size)
     
     device = torch.device(f"cuda:{rank}")
-    model, desc = create_model(model_name)
+    model, desc = create_model(model_name, img_size=img_size)
     model.to(device)
 
     # Wrap with DistributedDataParallel
@@ -143,7 +160,6 @@ def ddp_worker(
 
     # Each GPU gets a split of the global batch
     local_bs = global_batch_size // world_size
-    # If local_bs is 0, the shape could be (0, 3, 224, 224), causing cuFFT errors.
     if local_bs <= 0:
         # Raise an error or just return. We'll raise an error for clarity:
         raise ValueError(
@@ -151,7 +167,7 @@ def ddp_worker(
             "Resulting local batch size is 0."
         )
     
-    dummy_input = torch.randn(local_bs, 3, 224, 224).to(device)
+    dummy_input = torch.randn(local_bs, 3, img_size, img_size).to(device)
 
     # Measure per-rank latencies
     times = measure_latency(ddp_model, dummy_input, num_runs=num_runs, warmup=warmup)
@@ -176,7 +192,7 @@ def ddp_worker(
         avg_times = [t.item() for t in avg_list]
         std_times = [t.item() for t in std_list]
 
-        # Simple approach: total time = max of average latencies from all ranks
+        # total_time = max of average latencies from all ranks
         total_time = max(avg_times)
         throughput = global_batch_size / total_time
         
@@ -187,17 +203,17 @@ def ddp_worker(
         logger.info(f"  Throughput: {throughput:.2f} images/sec\n{'-'*60}")
 
         # Store in return_dict so the main process can retrieve the results
-        return_dict[model_name] = {
+        return_dict[(model_name, img_size)] = {
             "avg_time": total_time,
             "std_time": max(std_times),
             "throughput": throughput
         }
     cleanup()
 
-def run_ddp_experiment(model_name, global_batch_size, num_runs, warmup):
+def run_ddp_experiment(model_name, img_size, global_batch_size, num_runs, warmup):
     """
-    Launches a DDP experiment for a single model & batch size.
-    Returns a dict with keys ["avg_time", "std_time", "throughput"] from rank 0.
+    Launches a DDP experiment for a single model, single image size & batch size.
+    Returns a dict with keys ["avg_time", "std_time", "throughput"] from rank=0.
     """
     world_size = torch.cuda.device_count()
     if world_size < 2:
@@ -218,44 +234,33 @@ def run_ddp_experiment(model_name, global_batch_size, num_runs, warmup):
 
     mp.spawn(
         ddp_worker,
-        args=(world_size, model_name, global_batch_size, num_runs, warmup, return_dict),
+        args=(world_size, model_name, img_size, global_batch_size, num_runs, warmup, return_dict),
         nprocs=world_size,
         join=True
     )
     
-    return return_dict.get(model_name, None)
+    return return_dict.get((model_name, img_size), None)
 
 ##############################################################################
-# 3) Compare Both Models Across Multiple Batch Sizes & Plot
+# 3A) Compare Both Models Across Multiple Batch Sizes (One Image Size)
 ##############################################################################
 
-def compare_models_ddp(batch_sizes, num_runs, warmup):
+def compare_models_ddp(batch_sizes, num_runs, warmup, img_size=224):
     """
-    For each batch size, runs DDP for both models (FFTNetViT & ViT).
-    Collects latencies and throughputs, then plots them as PDFs.
-    
-    Why "CUFFT_INVALID_SIZE" can happen:
-      If the local batch size = 0 on any GPU, the tensor shape for one dimension
-      becomes zero. The cuFFT library will throw an error for an invalid transform
-      size. The fix is to ensure "global_batch_size >= world_size" and is evenly
-      divisible so each GPU has at least 1 sample.
+    For a single 'img_size', compares FFTNetViT & ViT across a list of 'batch_sizes'.
     """
     model_names = ["FFTNetViT", "ViT"]
-    # We'll store results in a dictionary:
-    # results[model_name]["batch_sizes"] = [...]
-    # results[model_name]["latencies"]   = [...]
-    # results[model_name]["throughputs"] = [...]
     results = {
         "FFTNetViT": {"batch_sizes": [], "latencies": [], "throughputs": []},
         "ViT":       {"batch_sizes": [], "latencies": [], "throughputs": []}
     }
 
     for bs in batch_sizes:
-        logger.info(f"\n===== GLOBAL BATCH SIZE: {bs} =====")
+        logger.info(f"\n===== GLOBAL BATCH SIZE: {bs}, IMG_SIZE: {img_size} =====")
         for m in model_names:
-            outcome = run_ddp_experiment(m, bs, num_runs, warmup)
+            outcome = run_ddp_experiment(m, img_size, bs, num_runs, warmup)
             if outcome is None:
-                # Means we either can't do DDP (1 GPU) or batch_size wasn't divisible
+                # Means we either can't do DDP or batch_size wasn't divisible
                 results[m]["batch_sizes"].append(bs)
                 results[m]["latencies"].append(float("nan"))
                 results[m]["throughputs"].append(float("nan"))
@@ -266,12 +271,7 @@ def compare_models_ddp(batch_sizes, num_runs, warmup):
                 results[m]["latencies"].append(avg_time)
                 results[m]["throughputs"].append(throughput)
 
-    # Now we create 2 comparison plots:
-    #  (1) Latency vs Batch Size (two lines: one for FFTNetViT, one for ViT)
-    #  (2) Throughput vs Batch Size (two lines)
-    # We'll save them as PDF files.
-
-    # 1) Latency vs Batch Size
+    # -- Plot Latency vs Batch Size
     plt.figure(figsize=(8, 6))
     plt.plot(
         results["FFTNetViT"]["batch_sizes"],
@@ -285,16 +285,16 @@ def compare_models_ddp(batch_sizes, num_runs, warmup):
         **vit_style,
         label="ViT",
     )
-    plt.title("Latency vs Batch Size (DDP)")
+    plt.title(f"Latency vs Batch Size (DDP) - Img {img_size}x{img_size}")
     plt.xlabel("Global Batch Size", fontweight="bold")
     plt.ylabel("Latency (ms)", fontweight="bold")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("ddp_latency_comparison.pdf")  # Save as PDF
+    plt.savefig(f"ddp_latency_comparison_{img_size}.pdf")
     plt.close()
 
-    # 2) Throughput vs Batch Size
+    # -- Plot Throughput vs Batch Size
     plt.figure(figsize=(8, 6))
     plt.plot(
         results["FFTNetViT"]["batch_sizes"],
@@ -308,18 +308,183 @@ def compare_models_ddp(batch_sizes, num_runs, warmup):
         **vit_style,
         label="ViT",
     )
-    plt.title("Throughput vs Batch Size (DDP)")
+    plt.title(f"Throughput vs Batch Size (DDP) - Img {img_size}x{img_size}")
     plt.xlabel("Global Batch Size", fontweight="bold")
     plt.ylabel("Throughput (images/sec)", fontweight="bold")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("ddp_throughput_comparison.pdf")  # Save as PDF
+    plt.savefig(f"ddp_throughput_comparison_{img_size}.pdf")
     plt.close()
 
-    logger.info("\nSaved comparison plots (PDF):")
-    logger.info("  ddp_latency_comparison.pdf")
-    logger.info("  ddp_throughput_comparison.pdf")
+    logger.info(f"\nSaved comparison plots for img_size={img_size}:")
+    logger.info(f"  ddp_latency_comparison_{img_size}.pdf")
+    logger.info(f"  ddp_throughput_comparison_{img_size}.pdf")
+
+    return results  # Return dictionary if you want further analysis
+
+##############################################################################
+# 3B) Compare Both Models Across MULTIPLE Image Sizes & Make Combined Plots
+##############################################################################
+
+def compare_models_ddp_across_image_sizes(
+    image_sizes, 
+    batch_sizes,
+    num_runs=10,
+    warmup=3
+):
+    """
+    For each image_size in 'image_sizes', and each global batch size in 'batch_sizes',
+    run DDP comparisons for both FFTNetViT and ViT. Store results and produce:
+      - a pair of plots per image size,
+      - optional "combined" plots with multiple lines (one line per (model,img_size)).
+    """
+    # We'll store results in a nested dict:
+    #   results[(model_name, img_size)]: 
+    #       {"batch_sizes": [...], "latencies": [...], "throughputs": [...]}
+    results = {}
+
+    model_names = ["FFTNetViT", "ViT"]
+
+    # -- Gather data
+    for img_size in image_sizes:
+        for m in model_names:
+            results[(m, img_size)] = {
+                "batch_sizes": [],
+                "latencies": [],
+                "throughputs": []
+            }
+        logger.info(f"\n\n***** IMAGE SIZE: {img_size}x{img_size} *****")
+        for bs in batch_sizes:
+            logger.info(f"Global Batch Size: {bs}")
+            outcome_fft = run_ddp_experiment("FFTNetViT", img_size, bs, num_runs, warmup)
+            outcome_vit = run_ddp_experiment("ViT",       img_size, bs, num_runs, warmup)
+
+            for (model_name, outcome) in zip(["FFTNetViT","ViT"], [outcome_fft, outcome_vit]):
+                if outcome is None:
+                    results[(model_name, img_size)]["batch_sizes"].append(bs)
+                    results[(model_name, img_size)]["latencies"].append(float("nan"))
+                    results[(model_name, img_size)]["throughputs"].append(float("nan"))
+                else:
+                    avg_time   = outcome["avg_time"]
+                    throughput = outcome["throughput"]
+                    results[(model_name, img_size)]["batch_sizes"].append(bs)
+                    results[(model_name, img_size)]["latencies"].append(avg_time)
+                    results[(model_name, img_size)]["throughputs"].append(throughput)
+        
+        # Optionally, we can also generate the 2-plot set for *each* image size,
+        # (just as we did in `compare_models_ddp`).
+        # We'll do that here for completeness:
+        fft_lat = [l*1000 for l in results[("FFTNetViT", img_size)]["latencies"]]
+        vit_lat = [l*1000 for l in results[("ViT", img_size)]["latencies"]]
+        fft_thr = results[("FFTNetViT", img_size)]["throughputs"]
+        vit_thr = results[("ViT", img_size)]["throughputs"]
+        x_bs    = results[("FFTNetViT", img_size)]["batch_sizes"]  # same as ViT's
+
+        # (A) Latency vs Batch Size
+        plt.figure(figsize=(8, 6))
+        plt.plot(x_bs, fft_lat, **fftnet_style, label="FFTNetViT")
+        plt.plot(x_bs, vit_lat, **vit_style,     label="ViT")
+        plt.title(f"Latency vs Batch Size (DDP) - Img {img_size}x{img_size}")
+        plt.xlabel("Global Batch Size", fontweight="bold")
+        plt.ylabel("Latency (ms)", fontweight="bold")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(f"ddp_latency_{img_size}.pdf")
+        plt.close()
+
+        # (B) Throughput vs Batch Size
+        plt.figure(figsize=(8, 6))
+        plt.plot(x_bs, fft_thr, **fftnet_style, label="FFTNetViT")
+        plt.plot(x_bs, vit_thr, **vit_style,     label="ViT")
+        plt.title(f"Throughput vs Batch Size (DDP) - Img {img_size}x{img_size}")
+        plt.xlabel("Global Batch Size", fontweight="bold")
+        plt.ylabel("Throughput (images/sec)", fontweight="bold")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(f"ddp_throughput_{img_size}.pdf")
+        plt.close()
+
+    # --- Now let's create COMBINED plots across all image_sizes in one figure ---
+    # 1) Combined Latency vs Batch Size
+    plt.figure(figsize=(8, 6))
+    for img_size in image_sizes:
+        # For each image size, we get the FFTNetViT latencies and make a line:
+        x_bs  = results[("FFTNetViT", img_size)]["batch_sizes"]
+        y_lat = [l * 1000 for l in results[("FFTNetViT", img_size)]["latencies"]]
+        plt.plot(
+            x_bs,
+            y_lat,
+            linestyle="--",
+            marker="o",
+            linewidth=2,
+            color=image_size_colors.get(img_size, "#000000"),  # fallback black if not in dict
+            label=f"FFTNetViT - {img_size}x{img_size}"
+        )
+    # Then do the same for ViT in a loop:
+    for img_size in image_sizes:
+        x_bs  = results[("ViT", img_size)]["batch_sizes"]
+        y_lat = [l * 1000 for l in results[("ViT", img_size)]["latencies"]]
+        plt.plot(
+            x_bs,
+            y_lat,
+            linestyle="-",
+            marker="s",
+            linewidth=2,
+            color=image_size_colors.get(img_size, "#000000"),
+            label=f"ViT - {img_size}x{img_size}"
+        )
+    plt.title("Combined Latency vs Batch Size (DDP) - Multiple Image Sizes")
+    plt.xlabel("Global Batch Size", fontweight="bold")
+    plt.ylabel("Latency (ms)", fontweight="bold")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("combined_ddp_latency_across_img_sizes.pdf")
+    plt.close()
+
+    # 2) Combined Throughput vs Batch Size
+    plt.figure(figsize=(8, 6))
+    for img_size in image_sizes:
+        x_bs  = results[("FFTNetViT", img_size)]["batch_sizes"]
+        y_thr = results[("FFTNetViT", img_size)]["throughputs"]
+        plt.plot(
+            x_bs,
+            y_thr,
+            linestyle="--",
+            marker="o",
+            linewidth=2,
+            color=image_size_colors.get(img_size, "#000000"),
+            label=f"FFTNetViT - {img_size}x{img_size}"
+        )
+    for img_size in image_sizes:
+        x_bs  = results[("ViT", img_size)]["batch_sizes"]
+        y_thr = results[("ViT", img_size)]["throughputs"]
+        plt.plot(
+            x_bs,
+            y_thr,
+            linestyle="-",
+            marker="s",
+            linewidth=2,
+            color=image_size_colors.get(img_size, "#000000"),
+            label=f"ViT - {img_size}x{img_size}"
+        )
+    plt.title("Combined Throughput vs Batch Size (DDP) - Multiple Image Sizes")
+    plt.xlabel("Global Batch Size", fontweight="bold")
+    plt.ylabel("Throughput (images/sec)", fontweight="bold")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("combined_ddp_throughput_across_img_sizes.pdf")
+    plt.close()
+
+    logger.info("\nSaved combined multi-size plots (PDF):")
+    logger.info("  combined_ddp_latency_across_img_sizes.pdf")
+    logger.info("  combined_ddp_throughput_across_img_sizes.pdf")
+
+    return results  # Return everything for further offline analysis if desired
 
 ##############################################################################
 # 4) Main Function & CLI
@@ -327,12 +492,17 @@ def compare_models_ddp(batch_sizes, num_runs, warmup):
 
 def parse_args():
     parser = argparse.ArgumentParser("DDP Comparison for FFTNetViT vs. ViT")
+    
+    # Examples: --image_sizes 32 64 128 224
+    parser.add_argument("--image_sizes", type=int, nargs="+", 
+                        default=[32, 224],  # CIFAR-10 (32x32) + ImageNet (224x224)
+                        help="List of image sizes to test (height=width).")
     parser.add_argument("--batch_sizes", type=int, nargs="+", 
-                        default=[8,16,32,128,256,512],  # updated default
-                        help="List of global batch sizes to test. Must be divisible by #GPUs.")
-    parser.add_argument("--num_runs", type=int, default=40,
+                        default=[8,16,32,64,128],  # choose sizes that are safe for your GPUs
+                        help="List of global batch sizes to test.")
+    parser.add_argument("--num_runs", type=int, default=10,
                         help="Number of timed runs for latency measurement.")
-    parser.add_argument("--warmup", type=int, default=5,
+    parser.add_argument("--warmup", type=int, default=3,
                         help="Number of warmup runs.")
     return parser.parse_args()
 
@@ -344,10 +514,19 @@ def main():
         return
 
     logger.info(f"Running DDP comparisons for: FFTNetViT vs. ViT")
+    logger.info(f"Image sizes: {args.image_sizes}")
     logger.info(f"Batch sizes: {args.batch_sizes}")
     logger.info(f"num_runs: {args.num_runs}, warmup: {args.warmup}")
 
-    compare_models_ddp(
+    # (A) If you only want to test a single image size at a time, use compare_models_ddp:
+    # compare_models_ddp(batch_sizes=args.batch_sizes,
+    #                    num_runs=args.num_runs,
+    #                    warmup=args.warmup,
+    #                    img_size=224)
+
+    # (B) If you want to test multiple image sizes in one run, use:
+    compare_models_ddp_across_image_sizes(
+        image_sizes=args.image_sizes,
         batch_sizes=args.batch_sizes,
         num_runs=args.num_runs,
         warmup=args.warmup
