@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,7 +34,7 @@ class MultiScaleSpectralAttention(nn.Module):
     """
     Multi-scale spectral attention module with:
       1) Global FFT over the entire sequence (with optional Hann window).
-      2) Local STFT (windowed FFT) with Hann windowing.
+      2) Local wavelet transform (Haar DWT -> scale/bias -> iDWT).
       3) A learned gating MLP to fuse global and local branches.
     """
     def __init__(
@@ -43,19 +44,17 @@ class MultiScaleSpectralAttention(nn.Module):
         num_heads=4,
         dropout=0.1,
         adaptive=True,
-        local_window_size=8,
         use_local_branch=True,
         use_global_hann=True
     ):
         """
         Args:
           embed_dim: Total embedding dimension.
-          seq_len:   Sequence length (#tokens, includes class token).
+          seq_len:   Sequence length (#tokens).
           num_heads: Number of attention heads.
-          dropout:   Dropout rate after iFFT.
-          adaptive:  If True, uses an MLP to produce (scale, bias) for frequency modulation.
-          local_window_size: Size of local STFT windows (e.g., 8).
-          use_local_branch: Whether to enable local STFT branch at all.
+          dropout:   Dropout rate after iFFT/iDWT.
+          adaptive:  If True, uses an MLP to produce (scale, bias) for freq/wavelet modulation.
+          use_local_branch: Whether to enable local wavelet transform branch at all.
           use_global_hann:  Whether to apply a Hann window over the entire sequence in the global branch.
         """
         super().__init__()
@@ -67,12 +66,11 @@ class MultiScaleSpectralAttention(nn.Module):
         self.seq_len = seq_len
         self.adaptive = adaptive
         self.use_local_branch = use_local_branch
-        self.local_window_size = local_window_size
         self.use_global_hann = use_global_hann
 
-        # -------------------------
-        # Global (full sequence) branch
-        # -------------------------
+        # ---------------------------------------------------
+        #  Global (full-sequence) FFT branch
+        # ---------------------------------------------------
         self.freq_bins_global = seq_len // 2 + 1
         self.base_filter_global = nn.Parameter(
             torch.ones(num_heads, self.freq_bins_global, 1)
@@ -84,37 +82,43 @@ class MultiScaleSpectralAttention(nn.Module):
         # Optional Hann window for the entire sequence
         if use_global_hann:
             hann_g = torch.hann_window(seq_len, periodic=False)  # (seq_len,)
-            hann_g = hann_g.view(1, 1, seq_len, 1)               # shape: (1,1,seq_len,1)
+            hann_g = hann_g.view(1, 1, seq_len, 1)               # (1,1,N,1)
             self.register_buffer("hann_window_global", hann_g)
 
-        # -------------------------
-        # Local (STFT) branch
-        # -------------------------
+        # ---------------------------------------------------
+        #  Local (wavelet) branch
+        # ---------------------------------------------------
         if use_local_branch:
-            self.freq_bins_local = local_window_size // 2 + 1
+            # Single-level Haar wavelet => 2 subbands: approx & detail
+            self.freq_bins_local = 2
+            # Base scale & bias for wavelet subbands => shape = (num_heads, 2, 1)
             self.base_filter_local = nn.Parameter(
                 torch.ones(num_heads, self.freq_bins_local, 1)
             )
             self.base_bias_local = nn.Parameter(
                 torch.full((num_heads, self.freq_bins_local, 1), -0.1)
             )
-            
-            # Register a Hann window buffer (not a Parameter) for local windowing
-            hann = torch.hann_window(local_window_size, periodic=False)  # (local_window_size,)
-            hann = hann.view(1, 1, 1, local_window_size, 1)
-            self.register_buffer("hann_window", hann)
+
+            # Haar wavelet filters (low-pass, high-pass), shape (2,).
+            lp = torch.tensor([1/math.sqrt(2), 1/math.sqrt(2)], dtype=torch.float32)
+            hp = torch.tensor([1/math.sqrt(2),-1/math.sqrt(2)], dtype=torch.float32)
+            wavelet_kernel = torch.stack([lp, hp], dim=0).unsqueeze(1)  # (2,1,2)
+            self.register_buffer("wavelet_kernel", wavelet_kernel)
+
         else:
             self.freq_bins_local = None
 
-        # Adaptive MLPs (for freq modulation) if needed
+        # ---------------------------------------------------
+        #  Adaptive MLPs
+        # ---------------------------------------------------
         if adaptive:
-            # For the global branch
+            # Global branch
             self.adaptive_mlp_global = nn.Sequential(
                 nn.Linear(embed_dim, embed_dim),
                 nn.GELU(),
                 nn.Linear(embed_dim, num_heads * self.freq_bins_global * 2)
             )
-            # For the local branch
+            # Local (wavelet) branch
             if use_local_branch:
                 self.adaptive_mlp_local = nn.Sequential(
                     nn.Linear(embed_dim, embed_dim),
@@ -126,17 +130,20 @@ class MultiScaleSpectralAttention(nn.Module):
         # Pre-normalization for stability
         self.pre_norm = nn.LayerNorm(embed_dim)
 
-        # If using local branch, we create a gating MLP to fuse local & global:
-        # alpha \in [0, 1]. We fuse local and global as: alpha * global + (1 - alpha) * local
+        # If local branch used, we create a gating MLP to fuse local & global:
+        # alpha ∈ [0,1]. Final = alpha*global + (1-alpha)*local
         if use_local_branch:
             self.fusion_mlp = nn.Sequential(
                 nn.Linear(embed_dim, embed_dim // 2),
                 nn.GELU(),
-                nn.Linear(embed_dim // 2, num_heads)  # outputs B x H
+                nn.Linear(embed_dim // 2, num_heads)  # (B, num_heads)
             )
         else:
             self.fusion_mlp = None
 
+    # ---------------------------------------------------
+    #  Complex activation for FFT branch
+    # ---------------------------------------------------
     def complex_activation(self, z):
         """
         Nonlinear activation in frequency domain (magnitude-based GELU).
@@ -147,26 +154,29 @@ class MultiScaleSpectralAttention(nn.Module):
         scale = mag_act / (mag + 1e-6)
         return z * scale
 
+    # ---------------------------------------------------
+    #  Global branch = full-sequence FFT
+    # ---------------------------------------------------
     def _transform_global(self, x_heads, adapt_params_global):
         """
         Perform global rFFT with optional Hann window and (optional) adaptive modulation.
         
-        x_heads shape: (B, H, N, head_dim)
-        Returns:       (B, H, N, head_dim)
+        x_heads: (B, H, N, head_dim)
+        Returns: (B, H, N, head_dim)
         """
         B, H, N, D = x_heads.shape
 
-        # Optionally multiply by global Hann window
+        # Optionally multiply by Hann window
         if self.use_global_hann:
-            x_heads = x_heads * self.hann_window_global  # broadcast: (1,1,N,1)
+            x_heads = x_heads * self.hann_window_global  # shape (1,1,N,1), broadcasts
 
         # Global rFFT
-        F_fft = torch.fft.rfft(x_heads, dim=2, norm='ortho')  # -> (B,H,freq_bins_global,D), complex
+        F_fft = torch.fft.rfft(x_heads, dim=2, norm='ortho')  # (B,H,freq_bins_global,D), complex
 
         # Adaptive freq modulation
         if self.adaptive and adapt_params_global is not None:
             adaptive_scale = adapt_params_global[..., 0:1]  # (B,H,freq_bins_global,1)
-            adaptive_bias = adapt_params_global[..., 1:2]   # (B,H,freq_bins_global,1)
+            adaptive_bias  = adapt_params_global[..., 1:2]  # (B,H,freq_bins_global,1)
         else:
             adaptive_scale = torch.zeros(
                 B, H, self.freq_bins_global, 1,
@@ -180,126 +190,157 @@ class MultiScaleSpectralAttention(nn.Module):
 
         # Multiply & add in frequency domain
         F_fft_mod = F_fft * effective_filter + effective_bias
-        # Nonlinear activation
+        # Nonlinear activation (complex)
         F_fft_nl = self.complex_activation(F_fft_mod)
 
         # iFFT
         x_global = torch.fft.irfft(F_fft_nl, dim=2, n=N, norm='ortho')
         return x_global
 
-    def _transform_local(self, x_heads, adapt_params_local):
+    # ---------------------------------------------------
+    #  Local branch = wavelet transform (single-level Haar)
+    # ---------------------------------------------------
+    def _transform_wavelet(self, x_heads, adapt_params_local):
         """
-        Perform local STFT in windows of size local_window_size, Hann-windowed.
-        
-        x_heads shape: (B, H, N, D)
+        Single-level Haar wavelet transform for each head:
+          1) DWT -> produces [approx, detail]
+          2) scale/bias + GELU in wavelet domain
+          3) iDWT -> reconstruct
+        x_heads: (B, H, N, D)
+        Returns: (B, H, N, D)
         """
         B, H, N, D = x_heads.shape
-        win_size = self.local_window_size
+        original_N = N  # remember for unpadding
 
-        # Pad if not multiple of win_size
-        pad_len = (win_size - (N % win_size)) % win_size
+        # If N is odd, pad by 1 so we have an even length for stride=2 transform
+        pad_len = (2 - (N % 2)) % 2
         if pad_len > 0:
-            pad_tensor = torch.zeros((B, H, pad_len, D), device=x_heads.device, dtype=x_heads.dtype)
-            x_heads_padded = torch.cat([x_heads, pad_tensor], dim=2)  # (B,H,N+pad_len,D)
-        else:
-            x_heads_padded = x_heads
+            # pad shape => (B,H,pad_len,D)
+            pad_zeros = torch.zeros(B, H, pad_len, D, dtype=x_heads.dtype, device=x_heads.device)
+            x_heads = torch.cat([x_heads, pad_zeros], dim=2)
+            N = N + pad_len  # update N
 
-        total_len = x_heads_padded.shape[2]
-        num_windows = total_len // win_size
+        # Reshape so that we treat 'D' as channels and 'N' as the length => (B*H, D, N)
+        x_reshape = x_heads.permute(0,1,3,2).reshape(B*H, D, N)  # (B*H, D, N)
 
-        # Reshape to (B, H, #windows, win_size, D)
-        x_heads_win = x_heads_padded.view(B, H, num_windows, win_size, D)
+        # Forward DWT (conv1d w stride=2). We want 2 subbands per channel -> out_channels=2*D.
+        # groups=D so each channel is filtered independently.
+        kernel = self.wavelet_kernel.repeat(D, 1, 1)  # shape (2D,1,2)
+        approx_detail = F.conv1d(
+            x_reshape,
+            kernel,
+            stride=2,
+            padding=0,
+            groups=D
+        )  # (B*H, 2D, N//2)
 
-        # Multiply by the local Hann window
-        # self.hann_window shape: (1,1,1,win_size,1) => broadcasts
-        x_heads_win = x_heads_win * self.hann_window
+        half_len = approx_detail.shape[-1]  # = N//2
+        # Reshape to (B,H,D,2,N//2)
+        approx_detail = approx_detail.view(B, H, 2*D, half_len)
+        approx_detail = approx_detail.view(B, H, D, 2, half_len)
 
-        # Local FFT over window dim=3
-        F_fft_local = torch.fft.rfft(x_heads_win, dim=3, norm='ortho')  # (B,H,#windows,freq_bins_local,D)
-
-        # Adaptive freq modulation
+        # Adaptive scale/bias for subbands => (B,H,2,2)
         if self.adaptive and adapt_params_local is not None:
-            # adapt_params_local: (B,H,freq_bins_local,2)
-            adaptive_scale = adapt_params_local[..., 0:1]  # (B,H,freq_bins_local,1)
-            adaptive_bias  = adapt_params_local[..., 1:2]  # (B,H,freq_bins_local,1)
-            # Expand for #windows
-            adaptive_scale = adaptive_scale.unsqueeze(2).expand(-1, -1, num_windows, -1, -1)
-            adaptive_bias  = adaptive_bias.unsqueeze(2).expand(-1, -1, num_windows, -1, -1)
+            # shape => scale/bias in [B,H,2,1]
+            adaptive_scale = adapt_params_local[..., 0:1]
+            adaptive_bias  = adapt_params_local[..., 1:2]
+
+            # Insert exactly one new dim to become (B,H,1,2,1),
+            # then expand to (B,H,D,2,half_len).
+            adaptive_scale = adaptive_scale.unsqueeze(2)  # => (B,H,1,2)
+            adaptive_scale = adaptive_scale.expand(-1, -1, D, -1, half_len)  # => (B,H,D,2,half_len)
+            adaptive_bias  = adaptive_bias.unsqueeze(2)   # => (B,H,1,2)
+            adaptive_bias  = adaptive_bias.expand(-1, -1, D, -1, half_len)   # => (B,H,D,2,half_len)
         else:
             adaptive_scale = torch.zeros(
-                B, H, num_windows, self.freq_bins_local, 1,
+                B, H, D, 2, half_len,
                 device=x_heads.device, dtype=x_heads.dtype
             )
             adaptive_bias = torch.zeros_like(adaptive_scale)
 
-        # Prepare base filters for broadcasting
-        base_filter_local = self.base_filter_local.unsqueeze(0).unsqueeze(2)  # (1,H,1,freq_bins_local,1)
-        base_bias_local   = self.base_bias_local.unsqueeze(0).unsqueeze(2)   # (1,H,1,freq_bins_local,1)
+        # Base filters for wavelet subbands => shape (num_heads,2,1)
+        # expand to (B,H,D,2,half_len)
+        base_filter_local = self.base_filter_local.view(1, self.num_heads, 1, 2, 1)
+        base_filter_local = base_filter_local.expand(B, -1, D, -1, half_len)
+        base_bias_local   = self.base_bias_local.view(1, self.num_heads, 1, 2, 1)
+        base_bias_local   = base_bias_local.expand(B, -1, D, -1, half_len)
 
+        # Multiply & add in wavelet domain
         effective_filter_local = base_filter_local * (1 + adaptive_scale)
         effective_bias_local   = base_bias_local + adaptive_bias
+        approx_detail_mod = approx_detail * effective_filter_local + effective_bias_local
 
-        # Multiply and add
-        F_fft_local_mod = F_fft_local * effective_filter_local + effective_bias_local
-        # Nonlinear activation
-        F_fft_local_nl = self.complex_activation(F_fft_local_mod)
+        # Nonlinear activation (real)
+        approx_detail_act = F.gelu(approx_detail_mod)
 
-        # iFFT
-        x_local_win = torch.fft.irfft(F_fft_local_nl, dim=3, n=win_size, norm='ortho')  # (B,H,#windows,win_size,D)
+        # Now inverse wavelet (conv_transpose1d):
+        # Reshape back to (B*H, 2D, N//2)
+        approx_detail_act = approx_detail_act.view(B, H, D*2, half_len)  # (B,H,2D,N//2)
+        approx_detail_act = approx_detail_act.view(B*H, 2*D, half_len)
 
-        # Reshape back, remove padding
-        x_local_padded = x_local_win.reshape(B, H, total_len, D)
+        # out_channels = D, in_channels=2D, groups=D
+        kernel_t = self.wavelet_kernel.repeat(D,1,1)  # shape (2D,1,2)
+        x_recon = F.conv_transpose1d(
+            approx_detail_act,
+            kernel_t,
+            stride=2,
+            padding=0,
+            groups=D
+        )  # => (B*H, D, N) but note N = padded length
+
+        # Reshape back to (B,H,N,D)
+        x_recon = x_recon.view(B, H, D, N).permute(0,1,3,2)
+
+        # If we padded, remove the extra from the length dimension
         if pad_len > 0:
-            x_local = x_local_padded[:, :, :N, :]
-        else:
-            x_local = x_local_padded
+            x_recon = x_recon[:, :, :original_N, :]
 
-        return x_local
+        return x_recon
 
+    # ---------------------------------------------------
+    #  Forward
+    # ---------------------------------------------------
     def forward(self, x):
         """
         x shape: (B, seq_len, embed_dim)
-        Returns: (B, seq_len, embed_dim) with residual connection.
+        Returns: (B, seq_len, embed_dim) with residual.
         """
         B, N, D = x.shape
-        # Pre-normalization
-        x_norm = self.pre_norm(x)
+        x_norm = self.pre_norm(x)  # pre-LayerNorm
         # Reshape into heads => (B,H,N,head_dim)
         x_heads = x_norm.view(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        # Context for adaptive MLPs and gating
+        # Adaptive MLP context
         context = x_norm.mean(dim=1)  # (B, embed_dim)
 
-        # Prepare global branch adapt
+        # Global branch adapt
         if self.adaptive:
-            adapt_params_global = self.adaptive_mlp_global(context)
+            adapt_params_global = self.adaptive_mlp_global(context)  # (B, num_heads*freq_bins_global*2)
             adapt_params_global = adapt_params_global.view(
                 B, self.num_heads, self.freq_bins_global, 2
             )
         else:
             adapt_params_global = None
 
-        # Global branch
+        # Global FFT branch
         x_global = self._transform_global(x_heads, adapt_params_global)
 
-        # Local branch (if used)
+        # Local wavelet branch
         if self.use_local_branch:
             if self.adaptive:
-                adapt_params_local = self.adaptive_mlp_local(context)
+                adapt_params_local = self.adaptive_mlp_local(context)  # (B, num_heads*2*2)
                 adapt_params_local = adapt_params_local.view(
-                    B, self.num_heads, self.freq_bins_local, 2
+                    B, self.num_heads, self.freq_bins_local, 2  # freq_bins_local=2
                 )
             else:
                 adapt_params_local = None
 
-            x_local = self._transform_local(x_heads, adapt_params_local)
+            x_local = self._transform_wavelet(x_heads, adapt_params_local)
 
-            # Gating MLP -> alpha in [0,1] for each head
+            # Gating alpha in [0,1] per head
             alpha = self.fusion_mlp(context)  # (B, num_heads)
-            alpha = torch.sigmoid(alpha)
-            alpha = alpha.view(B, self.num_heads, 1, 1)  # broadcast
-
-            x_fused_heads = alpha * x_global + (1.0 - alpha) * x_local
+            alpha = torch.sigmoid(alpha).view(B, self.num_heads, 1, 1)
+            x_fused_heads = alpha * x_global + (1 - alpha) * x_local
         else:
             x_fused_heads = x_global
 
