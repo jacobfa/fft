@@ -38,7 +38,6 @@ class FFTNetViT(nn.Module):
         dropout=0.1,
         num_heads=12,
         adaptive_spectral=True,
-        local_window_size=32,
         use_local_branch=True,
         use_global_hann=True
     ):
@@ -65,7 +64,6 @@ class FFTNetViT(nn.Module):
                 num_heads=num_heads,
                 dropout=dropout,
                 adaptive=adaptive_spectral,
-                local_window_size=local_window_size,
                 use_local_branch=use_local_branch,
                 use_global_hann=use_global_hann
             )
