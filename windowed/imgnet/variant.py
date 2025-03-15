@@ -234,7 +234,8 @@ def main():
             'num_heads': 12,
             'adaptive_spectral': True,
             'local_window_size': 32,
-            'use_local_branch': True
+            'use_local_branch': True,
+            'use_global_hann': True
         },
         'FFTNetViT Large': {
             'img_size': 224,
@@ -248,7 +249,8 @@ def main():
             'num_heads': 16,
             'adaptive_spectral': True,
             'local_window_size': 32,
-            'use_local_branch': True
+            'use_local_branch': True,
+            'use_global_hann': True
         },
         'FFTNetViT Huge': {
             'img_size': 224,
@@ -262,7 +264,8 @@ def main():
             'num_heads': 16,
             'adaptive_spectral': True,
             'local_window_size': 32,
-            'use_local_branch': True
+            'use_local_branch': True,
+            'use_global_hann': True
         }
     }
     
