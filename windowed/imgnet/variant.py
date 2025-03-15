@@ -2,17 +2,21 @@ import torch
 import logging
 import time
 import matplotlib.pyplot as plt
-import seaborn as sns
-import scienceplots  # Explicit import for custom styles
+import scienceplots  # for custom styles
 from ptflops import get_model_complexity_info
 from fftnet_vit import FFTNetViT
 from transformer import ViT
 
-# Set the plotting style and attractive Seaborn palette.
+# Use the scienceplots style you specified.
 plt.style.use(['science', 'no-latex', 'ieee'])
-# We'll use fixed colors for each variant type.
-variant_colors = {"Base": "red", "Large": "blue", "Huge": "black"}
-sns.set_palette(sns.color_palette(list(variant_colors.values())))
+
+# Define custom colors for each variant type.
+# (Base -> red, Large -> blue, Huge -> green).
+variant_colors = {
+    "Base":  "#e74c3c",  # Red
+    "Large": "#3498db",  # Blue
+    "Huge":  "#27ae60",  # Green
+}
 
 # Set up logging: both console and file output.
 logging.basicConfig(
@@ -84,22 +88,19 @@ def measure_all_latencies_for_batch_sizes(fftnet_variants, vit_variants, device,
     """
     latencies = {}
     
-    # Merge the variant dictionaries to process them in one loop
+    # Merge the variant dictionaries into a single structure
     all_variants = {}
     for k, v in fftnet_variants.items():
         all_variants[k] = ("FFTNetViT", v)
     for k, v in vit_variants.items():
         all_variants[k] = ("ViT", v)
     
-    # For each variant, instantiate the model, measure latencies for all batch sizes.
+    # For each variant, instantiate the model and measure latencies.
     for key, (family, config) in all_variants.items():
-        if family == "FFTNetViT":
-            model_class = FFTNetViT
-        else:
-            model_class = ViT
-        
+        model_class = FFTNetViT if family == "FFTNetViT" else ViT
         model = model_class(**config).to(device)
         latencies[key] = {}
+        
         for bs in batch_sizes:
             dummy_input = torch.randn(bs, 3, 224, 224).to(device)
             times = measure_latency(model, dummy_input, num_runs=10, warmup=3)
@@ -109,30 +110,37 @@ def measure_all_latencies_for_batch_sizes(fftnet_variants, vit_variants, device,
 
 def plot_combined_latency_vs_batch_size(fftnet_variants, vit_variants, latencies, batch_sizes):
     """
-    Plots average inference latency (ms) versus batch size for corresponding
-    FFTNetViT and standard ViT variants.
+    Plots average inference latency (ms) vs. batch size for corresponding
+    FFTNetViT and standard ViT variants, with custom red/blue/green colors.
     """
     plt.figure(figsize=(8, 6))
     
-    # Define line and marker styles for each family.
-    fftnet_style = {'linestyle': '--', 'marker': 'o'}  # Dashed with circles.
-    vit_style    = {'linestyle': '-',  'marker': 's'}  # Solid with squares.
+    # Styles for each family
+    fftnet_style = {'linestyle': '--', 'marker': 'o'}  # dashed line, circle marker
+    vit_style    = {'linestyle': '-',  'marker': 's'}  # solid line, square marker
     
     for variant_type in ["Base", "Large", "Huge"]:
-        # Retrieve model keys
         fft_key = f"FFTNetViT {variant_type}"
         vit_key = f"ViT {variant_type}"
         
         if fft_key in fftnet_variants and vit_key in vit_variants:
-            # Collect latencies for the FFTNet variant
-            latencies_fft = [latencies[fft_key][bs] * 1000 for bs in batch_sizes]  # ms
-            # Collect latencies for the ViT variant
-            latencies_vit = [latencies[vit_key][bs] * 1000 for bs in batch_sizes]  # ms
+            latencies_fft = [latencies[fft_key][bs] * 1000 for bs in batch_sizes]
+            latencies_vit = [latencies[vit_key][bs] * 1000 for bs in batch_sizes]
             
-            plt.plot(batch_sizes, latencies_fft, color=variant_colors[variant_type],
-                     label=f"{variant_type} (FFTNetViT)", **fftnet_style)
-            plt.plot(batch_sizes, latencies_vit, color=variant_colors[variant_type],
-                     label=f"{variant_type} (ViT)", **vit_style)
+            plt.plot(
+                batch_sizes,
+                latencies_fft,
+                color=variant_colors[variant_type],
+                label=f"{variant_type} (FFTNetViT)",
+                **fftnet_style
+            )
+            plt.plot(
+                batch_sizes,
+                latencies_vit,
+                color=variant_colors[variant_type],
+                label=f"{variant_type} (ViT)",
+                **vit_style
+            )
     
     plt.xlabel("Batch Size")
     plt.ylabel("Average Latency (ms)")
@@ -145,8 +153,7 @@ def plot_combined_latency_vs_batch_size(fftnet_variants, vit_variants, latencies
 
 def plot_throughput_vs_batch_size(fftnet_variants, vit_variants, latencies, batch_sizes):
     """
-    Plots throughput (images/second) vs. batch size for FFTNetViT and ViT.
-    Throughput is computed as (batch_size / average_latency_in_seconds).
+    Plots throughput (images/second) vs. batch size with red/blue/green colors.
     """
     plt.figure(figsize=(8, 6))
     
@@ -158,22 +165,30 @@ def plot_throughput_vs_batch_size(fftnet_variants, vit_variants, latencies, batc
         vit_key = f"ViT {variant_type}"
         
         if fft_key in fftnet_variants and vit_key in vit_variants:
-            # FFTNet throughput
             thpt_fft = []
-            # ViT throughput
             thpt_vit = []
             
             for bs in batch_sizes:
                 # Throughput = batch_size / latency_in_seconds
-                t_fft = batch_sizes[batch_sizes.index(bs)] / latencies[fft_key][bs]
-                t_vit = batch_sizes[batch_sizes.index(bs)] / latencies[vit_key][bs]
+                t_fft = bs / latencies[fft_key][bs]
+                t_vit = bs / latencies[vit_key][bs]
                 thpt_fft.append(t_fft)
                 thpt_vit.append(t_vit)
             
-            plt.plot(batch_sizes, thpt_fft, color=variant_colors[variant_type],
-                     label=f"{variant_type} (FFTNetViT)", **fftnet_style)
-            plt.plot(batch_sizes, thpt_vit, color=variant_colors[variant_type],
-                     label=f"{variant_type} (ViT)", **vit_style)
+            plt.plot(
+                batch_sizes,
+                thpt_fft,
+                color=variant_colors[variant_type],
+                label=f"{variant_type} (FFTNetViT)",
+                **fftnet_style
+            )
+            plt.plot(
+                batch_sizes,
+                thpt_vit,
+                color=variant_colors[variant_type],
+                label=f"{variant_type} (ViT)",
+                **vit_style
+            )
     
     plt.xlabel("Batch Size")
     plt.ylabel("Throughput (images/second)")
@@ -186,9 +201,8 @@ def plot_throughput_vs_batch_size(fftnet_variants, vit_variants, latencies, batc
 
 def plot_speedup_vs_batch_size(fftnet_variants, vit_variants, latencies, batch_sizes):
     """
-    Plots speedup vs. batch size. Speedup is defined as:
-        speedup = latency(ViT) / latency(FFTNetViT)
-    Values > 1 indicate FFTNetViT is faster (lower latency).
+    Plots speedup vs. batch size with red/blue/green colors.
+    Speedup = latency(ViT) / latency(FFTNetViT).
     """
     plt.figure(figsize=(8, 6))
     
@@ -199,16 +213,22 @@ def plot_speedup_vs_batch_size(fftnet_variants, vit_variants, latencies, batch_s
         if fft_key in fftnet_variants and vit_key in vit_variants:
             speedups = []
             for bs in batch_sizes:
-                # speedup = (ViT latency) / (FFTNet latency)
                 speedup_ratio = latencies[vit_key][bs] / latencies[fft_key][bs]
                 speedups.append(speedup_ratio)
             
-            plt.plot(batch_sizes, speedups, color=variant_colors[variant_type],
-                     marker='o', linestyle='-', label=f"{variant_type}")
+            plt.plot(
+                batch_sizes,
+                speedups,
+                color=variant_colors[variant_type],
+                marker='o',
+                linestyle='-',
+                label=f"{variant_type}"
+            )
     
+    # Reference line at speedup=1
     plt.axhline(y=1.0, color='gray', linestyle='--', label='No Speedup')
     plt.xlabel("Batch Size")
-    plt.ylabel("Speedup (ViT latency / FFTNet latency)")
+    plt.ylabel("Speedup (ViT latency / FFTNetViT latency)")
     plt.title("Speedup vs Batch Size: ViT / FFTNetViT")
     plt.legend()
     plt.grid(True)
@@ -220,7 +240,7 @@ def main():
     # Determine device: use GPU if available, else CPU.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # FFTNetViT Variants configurations (all with local windowing).
+    # FFTNetViT variants (local windowing).
     fftnet_variants = {
         'FFTNetViT Base': {
             'img_size': 224,
@@ -233,7 +253,6 @@ def main():
             'dropout': 0.1,
             'num_heads': 12,
             'adaptive_spectral': True,
-            'local_window_size': 32,
             'use_local_branch': True,
             'use_global_hann': True
         },
@@ -248,7 +267,6 @@ def main():
             'dropout': 0.1,
             'num_heads': 16,
             'adaptive_spectral': True,
-            'local_window_size': 32,
             'use_local_branch': True,
             'use_global_hann': True
         },
@@ -263,13 +281,12 @@ def main():
             'dropout': 0.1,
             'num_heads': 16,
             'adaptive_spectral': True,
-            'local_window_size': 32,
             'use_local_branch': True,
             'use_global_hann': True
         }
     }
     
-    # Standard ViT Variants configurations (ViT-B/16, ViT-L/16, ViT-H/16).
+    # Standard ViT variants (ViT-B/16, ViT-L/16, ViT-H/16).
     vit_variants = {
         'ViT Base': {
             'img_size': 224,
@@ -322,7 +339,7 @@ def main():
         logger.info(f"{key} - Average Latency (batch size 1): {avg_latency * 1000:.2f} ms")
         logger.info("-" * 50)
     
-    # Now measure latencies for a range of batch sizes for all variants
+    # Now measure latencies for a range of batch sizes.
     batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128]
     latencies_dict = measure_all_latencies_for_batch_sizes(fftnet_variants, vit_variants, device, batch_sizes)
     
