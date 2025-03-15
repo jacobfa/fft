@@ -117,9 +117,9 @@ def main():
         logger = None
 
     # Hyperparameters.
-    batch_size = 16
+    batch_size = 128
     epochs = 300
-    learning_rate = 1e-2
+    learning_rate = 1e-3
     weight_decay = 0.05
     label_smoothing = 0.0  
     warmup_epochs = 10
