@@ -10,8 +10,12 @@ from transformer import ViT
 # Use the scienceplots style you specified.
 plt.style.use(['science', 'no-latex', 'ieee'])
 
-# Define custom colors for each variant type.
-# (Base -> red, Large -> blue, Huge -> green).
+# Make all text bold
+plt.rcParams['font.weight'] = 'bold'
+plt.rcParams['axes.labelweight'] = 'bold'
+plt.rcParams['axes.titleweight'] = 'bold'
+
+# Define custom colors for each variant type (Base -> Red, Large -> Blue, Huge -> Green).
 variant_colors = {
     "Base":  "#e74c3c",  # Red
     "Large": "#3498db",  # Blue
@@ -111,13 +115,14 @@ def measure_all_latencies_for_batch_sizes(fftnet_variants, vit_variants, device,
 def plot_combined_latency_vs_batch_size(fftnet_variants, vit_variants, latencies, batch_sizes):
     """
     Plots average inference latency (ms) vs. batch size for corresponding
-    FFTNetViT and standard ViT variants, with custom red/blue/green colors.
+    FFTNetViT and standard ViT variants, with custom red/blue/green colors
+    and thick, bold lines.
     """
     plt.figure(figsize=(8, 6))
     
     # Styles for each family
-    fftnet_style = {'linestyle': '--', 'marker': 'o'}  # dashed line, circle marker
-    vit_style    = {'linestyle': '-',  'marker': 's'}  # solid line, square marker
+    fftnet_style = {'linestyle': '--', 'marker': 'o'}
+    vit_style    = {'linestyle': '-',  'marker': 's'}
     
     for variant_type in ["Base", "Large", "Huge"]:
         fft_key = f"FFTNetViT {variant_type}"
@@ -132,6 +137,7 @@ def plot_combined_latency_vs_batch_size(fftnet_variants, vit_variants, latencies
                 latencies_fft,
                 color=variant_colors[variant_type],
                 label=f"{variant_type} (FFTNetViT)",
+                linewidth=2,  # Thicker line
                 **fftnet_style
             )
             plt.plot(
@@ -139,12 +145,13 @@ def plot_combined_latency_vs_batch_size(fftnet_variants, vit_variants, latencies
                 latencies_vit,
                 color=variant_colors[variant_type],
                 label=f"{variant_type} (ViT)",
+                linewidth=2,  # Thicker line
                 **vit_style
             )
     
-    plt.xlabel("Batch Size")
-    plt.ylabel("Average Latency (ms)")
-    plt.title("Latency vs Batch Size: FFTNetViT vs Standard ViT")
+    plt.xlabel("Batch Size", fontweight='bold')
+    plt.ylabel("Average Latency (ms)", fontweight='bold')
+    plt.title("Latency vs Batch Size: FFTNetViT vs Standard ViT", fontweight='bold')
     plt.legend()
     plt.grid(True)
     plt.savefig("combined_latency_comparison.pdf")
@@ -153,7 +160,8 @@ def plot_combined_latency_vs_batch_size(fftnet_variants, vit_variants, latencies
 
 def plot_throughput_vs_batch_size(fftnet_variants, vit_variants, latencies, batch_sizes):
     """
-    Plots throughput (images/second) vs. batch size with red/blue/green colors.
+    Plots throughput (images/second) vs. batch size with custom colors,
+    thicker lines, and bold text.
     """
     plt.figure(figsize=(8, 6))
     
@@ -169,8 +177,7 @@ def plot_throughput_vs_batch_size(fftnet_variants, vit_variants, latencies, batc
             thpt_vit = []
             
             for bs in batch_sizes:
-                # Throughput = batch_size / latency_in_seconds
-                t_fft = bs / latencies[fft_key][bs]
+                t_fft = bs / latencies[fft_key][bs]  # Throughput = batch_size / latency
                 t_vit = bs / latencies[vit_key][bs]
                 thpt_fft.append(t_fft)
                 thpt_vit.append(t_vit)
@@ -180,6 +187,7 @@ def plot_throughput_vs_batch_size(fftnet_variants, vit_variants, latencies, batc
                 thpt_fft,
                 color=variant_colors[variant_type],
                 label=f"{variant_type} (FFTNetViT)",
+                linewidth=2,
                 **fftnet_style
             )
             plt.plot(
@@ -187,12 +195,13 @@ def plot_throughput_vs_batch_size(fftnet_variants, vit_variants, latencies, batc
                 thpt_vit,
                 color=variant_colors[variant_type],
                 label=f"{variant_type} (ViT)",
+                linewidth=2,
                 **vit_style
             )
     
-    plt.xlabel("Batch Size")
-    plt.ylabel("Throughput (images/second)")
-    plt.title("Throughput vs Batch Size: FFTNetViT vs Standard ViT")
+    plt.xlabel("Batch Size", fontweight='bold')
+    plt.ylabel("Throughput (images/second)", fontweight='bold')
+    plt.title("Throughput vs Batch Size: FFTNetViT vs Standard ViT", fontweight='bold')
     plt.legend()
     plt.grid(True)
     plt.savefig("combined_throughput_comparison.pdf")
@@ -201,7 +210,7 @@ def plot_throughput_vs_batch_size(fftnet_variants, vit_variants, latencies, batc
 
 def plot_speedup_vs_batch_size(fftnet_variants, vit_variants, latencies, batch_sizes):
     """
-    Plots speedup vs. batch size with red/blue/green colors.
+    Plots speedup vs. batch size with custom colors, thicker lines, and bold text.
     Speedup = latency(ViT) / latency(FFTNetViT).
     """
     plt.figure(figsize=(8, 6))
@@ -222,14 +231,14 @@ def plot_speedup_vs_batch_size(fftnet_variants, vit_variants, latencies, batch_s
                 color=variant_colors[variant_type],
                 marker='o',
                 linestyle='-',
+                linewidth=2,
                 label=f"{variant_type}"
             )
     
-    # Reference line at speedup=1
-    plt.axhline(y=1.0, color='gray', linestyle='--', label='No Speedup')
-    plt.xlabel("Batch Size")
-    plt.ylabel("Speedup (ViT latency / FFTNetViT latency)")
-    plt.title("Speedup vs Batch Size: ViT / FFTNetViT")
+    plt.axhline(y=1.0, color='gray', linestyle='--', label='No Speedup', linewidth=1.5)
+    plt.xlabel("Batch Size", fontweight='bold')
+    plt.ylabel("Speedup (ViT latency / FFTNetViT latency)", fontweight='bold')
+    plt.title("Speedup vs Batch Size: ViT / FFTNetViT", fontweight='bold')
     plt.legend()
     plt.grid(True)
     plt.savefig("combined_speedup_comparison.pdf")
