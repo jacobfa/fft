@@ -1,7 +1,32 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+def drop_path(x, drop_prob: float = 0., training: bool = False):
+    """
+    Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
+    """
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    # Generate binary tensor mask; shape: (batch_size, 1, 1, ..., 1)
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()  # binarize
+    output = x.div(keep_prob) * random_tensor
+    return output
+
+class DropPath(nn.Module):
+    """
+    DropPath module that performs stochastic depth.
+    """
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
 
 class MultiHeadSpectralAttention(nn.Module):
     def __init__(
@@ -11,286 +36,217 @@ class MultiHeadSpectralAttention(nn.Module):
         num_heads=4,
         dropout=0.1,
         adaptive=True,
-        fuse_method="gating",  # or "concat"
-        wavelet="haar"         # only "haar" implemented here
+        combine_mode='gate',  # 'gate' or 'concat'
     ):
         """
-        A multi‐head spectral attention block that combines:
-          1) Global interactions via FFT.
-          2) Local interactions via a single-level Wavelet transform.
+        Spectral attention module that introduces additional nonlinearity and adaptivity
+        while maintaining an n log n computational overhead. Also adds a local wavelet
+        transform to capture local dependencies.
 
-        The results of these two paths are fused either by:
-          - gating (default): alpha * FFT_path + (1 - alpha) * Wavelet_path
-          - concatenation: [FFT_path, Wavelet_path] -> linear projection
-
-        Args:
-            embed_dim: total embedding dimension.
-            seq_len: sequence length (e.g. number of patches + 1 for a class token).
-            num_heads: number of attention heads.
-            dropout: dropout rate.
-            adaptive: if True, uses MLPs to modulate base filters for both FFT and wavelet paths.
-            fuse_method: how to fuse FFT-based output and wavelet-based output:
-                         "gating" or "concat"
-            wavelet: wavelet type, only "haar" is implemented.
+        Parameters:
+          - embed_dim: Total embedding dimension.
+          - seq_len: Sequence length (e.g. number of tokens, including class token).
+          - num_heads: Number of attention heads.
+          - dropout: Dropout rate applied after iFFT.
+          - adaptive: If True, uses an MLP to generate both multiplicative and additive
+                      adaptive modulations for the FFT.
+          - combine_mode: 'gate' to blend local and global features via a learned scalar,
+                          or 'concat' to concatenate and project back down.
         """
         super().__init__()
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads")
-
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.seq_len = seq_len
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(embed_dim)
         self.adaptive = adaptive
-        self.fuse_method = fuse_method
+        self.combine_mode = combine_mode
 
-        # -- FFT-related parameters --
-        # Real rFFT reduces the frequency dimension to seq_len // 2 + 1.
+        # Frequency bins for rFFT: (seq_len//2 + 1)
         self.freq_bins = seq_len // 2 + 1
 
-        # Base filter for FFT path: shape (num_heads, freq_bins, 1)
-        self.base_filter_fft = nn.Parameter(torch.ones(num_heads, self.freq_bins, 1))
+        # ---- FFT parameters ----
+        # Base multiplicative filter: one per head and frequency bin.
+        self.base_filter = nn.Parameter(torch.ones(num_heads, self.freq_bins, 1))
+        # Base additive bias.
+        self.base_bias = nn.Parameter(torch.full((num_heads, self.freq_bins, 1), -0.1))
 
-        # modReLU bias for the complex FFT coefficients
-        self.modrelu_bias_fft = nn.Parameter(
-            torch.full((num_heads, self.freq_bins, 1), -0.1)
-        )
-
-        # -- Wavelet-related parameters --
-        # We implement a single-level Haar transform for local dependencies.
-        # We no longer require seq_len to be even; we will pad if needed.
-        # We'll store separate filters for approx and detail.
-        # Shape for each: (num_heads, wavelet_len, 1), though wavelet_len = ceil(seq_len/2) if odd
-        # However, we will just create them for the largest possible half = (seq_len+1)//2
-        self.wavelet_len = (seq_len + 1) // 2  # maximum half-length for odd seq_len
-
-        self.base_filter_wavelet_approx = nn.Parameter(
-            torch.ones(num_heads, self.wavelet_len, 1)
-        )
-        self.base_filter_wavelet_detail = nn.Parameter(
-            torch.ones(num_heads, self.wavelet_len, 1)
-        )
-
-        # -- Adaptive MLPs (optional) --
-        # If adaptive=True, we learn how to modulate both FFT and wavelet filters
-        # from a global context vector (mean-pooled input).
+        # ---- Adaptive MLP (if enabled) ----
         if adaptive:
-            # For FFT
-            self.adaptive_mlp_fft = nn.Sequential(
+            # Produces scale and bias for each (head, freq_bin).
+            self.adaptive_mlp = nn.Sequential(
                 nn.Linear(embed_dim, embed_dim),
                 nn.GELU(),
-                nn.Linear(embed_dim, num_heads * self.freq_bins),
-            )
-            # For wavelet: need to modulate both approx & detail
-            # => 2 * wavelet_len * num_heads total
-            self.adaptive_mlp_wavelet = nn.Sequential(
-                nn.Linear(embed_dim, embed_dim),
-                nn.GELU(),
-                nn.Linear(embed_dim, 2 * num_heads * self.wavelet_len),
+                nn.Linear(embed_dim, num_heads * self.freq_bins * 2)
             )
 
-        # -- Fusion method --
-        if fuse_method not in ["gating", "concat"]:
-            raise ValueError('fuse_method must be "gating" or "concat"')
-
-        if fuse_method == "gating":
-            # A learnable scalar (or vector) gate can also be used; here we use a single scalar:
-            self.alpha = nn.Parameter(torch.tensor(0.0))
+        # ---- Wavelet gating or concatenation ----
+        # A scalar gate for 'gate' mode
+        if self.combine_mode == 'gate':
+            # We'll learn a single gate that is broadcast across batch, heads, and positions.
+            self.gate_param = nn.Parameter(torch.tensor(0.0))
+            self.proj_concat = None  # Not used in gating mode
+        elif self.combine_mode == 'concat':
+            # A projection to bring concatenated (local + global) features back to embed_dim
+            self.proj_concat = nn.Linear(2 * embed_dim, embed_dim)
+            self.gate_param = None
         else:
-            # If we concat, we need a linear to go back to embed_dim
-            self.proj_concat = nn.Linear(embed_dim * 2, embed_dim)
+            raise ValueError("combine_mode must be either 'gate' or 'concat'")
 
-    def modrelu(self, z):
+        self.dropout = nn.Dropout(dropout)
+        # Pre-normalization for improved stability before FFT.
+        self.pre_norm = nn.LayerNorm(embed_dim)
+
+    def complex_activation(self, z):
         """
-        modReLU activation for complex-valued input z.
-        z: (B, num_heads, freq_bins, head_dim) [complex tensor]
-        Returns the same shape, with modReLU applied channel-wise.
+        Applies a nonlinear activation to a complex tensor.
+        This function takes the magnitude of z, passes it through GELU, and rescales z accordingly,
+        preserving the phase.
+
+        Args:
+          z: complex tensor of shape (B, num_heads, freq_bins, head_dim)
+        Returns:
+          Activated complex tensor of the same shape.
         """
-        z_abs = torch.abs(z)
-        bias = self.modrelu_bias_fft.unsqueeze(0)  # shape (1, num_heads, freq_bins, 1)
-        # Clamp the magnitude to avoid division by small numbers
-        z_abs_clamped = torch.clamp(z_abs, min=1e-3)
-        # modReLU => ReLU(|z| + bias) or GELU(|z| + bias). We'll keep it consistent with code:
-        activated = F.gelu(z_abs + bias)
-        # Scale factor
-        scale = activated / z_abs_clamped
+        mag = torch.abs(z)
+        # Nonlinear transformation on the magnitude; using GELU for smooth nonlinearity.
+        mag_act = F.gelu(mag)
+        # Compute scaling factor; add a small epsilon to avoid division by zero.
+        scale = mag_act / (mag + 1e-6)
         return z * scale
 
-    def wavelet_transform(self, x):
+    def wavelet_transform(self, x_heads):
         """
-        Single-level Haar wavelet transform that supports odd sequence length by zero-padding.
-        x: shape (B, L), real.
+        Applies a single-level Haar wavelet transform (decomposition + reconstruction)
+        to capture local dependencies along the sequence dimension.
+
+        Args:
+          x_heads: Tensor of shape (B, num_heads, seq_len, head_dim)
 
         Returns:
-          approx: (B, L_pad//2)
-          detail: (B, L_pad//2)
-          pad_len: how many zeros we added on the right if L is odd (0 or 1).
+          Reconstructed wavelet-based features of the same shape (B, num_heads, seq_len, head_dim).
         """
-        B, L = x.shape
-        pad_len = 0
-        # If length is odd, pad one zero on the right
-        if L % 2 != 0:
-            pad_len = 1
-            x = F.pad(x, (0, pad_len), mode="constant", value=0.0)  # shape (B, L+1)
-            L = L + pad_len
+        B, H, N, D = x_heads.shape
 
-        # L is now even; do single-level Haar
-        half = L // 2
-        x_even = x[:, 0::2]
-        x_odd = x[:, 1::2]
-        approx = (x_even + x_odd) / math.sqrt(2)
-        detail = (x_even - x_odd) / math.sqrt(2)
-        return approx, detail, pad_len
+        # For simplicity, if N is odd, truncate by one
+        N_even = N if (N % 2) == 0 else (N - 1)
+        x_heads = x_heads[:, :, :N_even, :]  # shape -> (B, H, N_even, D)
 
-    def wavelet_inverse(self, approx, detail, pad_len):
-        """
-        Inverse single-level Haar wavelet transform that removes padding if it was applied.
-        approx, detail: (B, half)
-        pad_len: how many zeros were added (0 or 1).
-        
-        Returns:
-          x: (B, original_L)  # i.e., without the padding if present.
-        """
-        B, half = approx.shape
-        L = half * 2  # the padded length
-        x = approx.new_zeros(B, L)
+        # Split even and odd positions along sequence dimension
+        x_even = x_heads[:, :, 0::2, :]  # (B, H, N_even/2, D)
+        x_odd  = x_heads[:, :, 1::2, :]  # (B, H, N_even/2, D)
 
-        # x_even = (approx + detail)/sqrt(2)
-        # x_odd  = (approx - detail)/sqrt(2)
-        x[:, 0::2] = (approx + detail) / math.sqrt(2)
-        x[:, 1::2] = (approx - detail) / math.sqrt(2)
+        # Haar wavelet decomposition
+        # approx = 0.5*(even + odd), detail = 0.5*(even - odd)
+        approx = 0.5 * (x_even + x_odd)
+        detail = 0.5 * (x_even - x_odd)
 
-        # If we padded, remove the extra columns at the end
-        if pad_len > 0:
-            x = x[:, :-pad_len]
-        return x
+        # A nonlinearity can optionally be applied to approx/detail
+        approx = F.gelu(approx)
+        detail = F.gelu(detail)
+
+        # Haar wavelet reconstruction
+        # even' = approx + detail, odd' = approx - detail
+        x_even_recon = approx + detail
+        x_odd_recon  = approx - detail
+
+        # Interleave even/odd back to original shape
+        out = torch.zeros_like(x_heads)
+        out[:, :, 0::2, :] = x_even_recon
+        out[:, :, 1::2, :] = x_odd_recon
+
+        # If we truncated one position, pad it back with zeros
+        if N_even < N:
+            pad = torch.zeros((B, H, 1, D), device=out.device, dtype=out.dtype)
+            out = torch.cat([out, pad], dim=2)
+
+        return out
 
     def forward(self, x):
         """
-        x: (B, seq_len, embed_dim)
+        Forward pass of the enhanced spectral attention module.
+
+        Args:
+          x: Input tensor of shape (B, seq_len, embed_dim)
+
         Returns:
-          (B, seq_len, embed_dim) after combining global (FFT) and local (Wavelet) paths.
+          Tensor of shape (B, seq_len, embed_dim) with combined wavelet (local) and
+          FFT-based (global) modulation, plus a residual connection.
         """
         B, N, D = x.shape
-        # x_heads => (B, num_heads, seq_len, head_dim)
-        x_heads = x.view(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        # 1) Global path: Real FFT -> filter -> modReLU -> iFFT
-        # -----------------------------------------------------
-        F_fft = torch.fft.rfft(x_heads, dim=2, norm="ortho")  
-        # shape (B, num_heads, freq_bins, head_dim)
+        # Pre-normalize input for more stable frequency transformations.
+        x_norm = self.pre_norm(x)
 
-        # Adaptive filter (FFT)
+        # Reshape to separate heads: (B, num_heads, seq_len, head_dim)
+        x_heads = x_norm.view(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        # ---- (1) FFT-based global features ----
+        F_fft = torch.fft.rfft(x_heads, dim=2, norm='ortho')  # shape (B, num_heads, freq_bins, head_dim)
+
+        # Adaptive scale/bias if enabled
         if self.adaptive:
-            # Global context vector: (B, embed_dim)
-            context = x.mean(dim=1)  # mean over tokens
-            mod_fft = self.adaptive_mlp_fft(context)  # => (B, num_heads * freq_bins)
-            mod_fft = torch.tanh(mod_fft)
-            mod_fft = mod_fft.view(B, self.num_heads, self.freq_bins, 1)
-            filter_fft = self.base_filter_fft.unsqueeze(0) + mod_fft
-            # shape (B, num_heads, freq_bins, 1)
+            # Global context: average over tokens (B, embed_dim)
+            context = x_norm.mean(dim=1)  # (B, embed_dim)
+            # Produce 2 values per (head, freq_bin) -> (scale, bias)
+            adapt_params = self.adaptive_mlp(context)  # (B, num_heads*freq_bins*2)
+            adapt_params = adapt_params.view(B, self.num_heads, self.freq_bins, 2)
+            adaptive_scale = adapt_params[..., 0:1]  # shape (B, num_heads, freq_bins, 1)
+            adaptive_bias  = adapt_params[..., 1:2]  # shape (B, num_heads, freq_bins, 1)
         else:
-            # Static base filter
-            filter_fft = self.base_filter_fft.unsqueeze(0)  # (1, num_heads, freq_bins, 1)
+            adaptive_scale = torch.zeros(B, self.num_heads, self.freq_bins, 1, device=x.device)
+            adaptive_bias  = torch.zeros(B, self.num_heads, self.freq_bins, 1, device=x.device)
 
-        # Multiply FFT coefficients by filter
-        F_fft = F_fft * filter_fft
-        # Complex modReLU
-        F_fft = self.modrelu(F_fft)
-        # iFFT
-        x_fft = torch.fft.irfft(F_fft, dim=2, n=self.seq_len, norm="ortho")
-        # x_fft => (B, num_heads, seq_len, head_dim)
-        x_fft = x_fft.permute(0, 2, 1, 3).reshape(B, N, D)
+        # Combine base parameters with adaptive modulations
+        effective_filter = self.base_filter * (1 + adaptive_scale)  # (num_heads, freq_bins, 1) broadcast with (B, ...)
+        effective_bias   = self.base_bias + adaptive_bias
 
-        # 2) Local path: Wavelet transform -> filter -> activation -> inverse wavelet
-        # ---------------------------------------------------------------------------
-        # Flatten (B, num_heads, seq_len, head_dim) => (B*num_heads*head_dim, seq_len)
-        x_heads_flat = x_heads.reshape(B * self.num_heads * self.head_dim, N)
+        # Apply modulations in the frequency domain
+        F_fft_mod = F_fft * effective_filter + effective_bias
 
-        # Single-level Haar wavelet (with optional padding)
-        wave_approx, wave_detail, pad_len = self.wavelet_transform(x_heads_flat)
+        # Nonlinear activation in the frequency domain
+        F_fft_nl = self.complex_activation(F_fft_mod)
 
-        # wave_approx, wave_detail => each shape: (B*num_heads*head_dim, N_pad//2)
-        # Now reshape to (B, num_heads, head_dim, wavelet_len) to broadcast filters
-        wave_approx = wave_approx.view(B, self.num_heads, self.head_dim, -1)
-        wave_detail = wave_detail.view(B, self.num_heads, self.head_dim, -1)
+        # Inverse FFT to bring data back to token space
+        x_fft = torch.fft.irfft(F_fft_nl, dim=2, n=self.seq_len, norm='ortho')  # (B, num_heads, seq_len, head_dim)
 
-        # We want to multiply across wavelet_len dimension => reorder to (B, num_heads, wavelet_len, head_dim)
-        wave_approx = wave_approx.permute(0, 1, 3, 2)
-        wave_detail = wave_detail.permute(0, 1, 3, 2)
+        # ---- (2) Wavelet-based local features ----
+        x_wavelet = self.wavelet_transform(x_heads)  # (B, num_heads, seq_len, head_dim)
 
-        # Adaptive wavelet filter
-        if self.adaptive:
-            # Re-use the same global context
-            wave_out = self.adaptive_mlp_wavelet(context)  # (B, 2 * num_heads * wavelet_len)
-            wave_out = torch.tanh(wave_out)
-
-            wave_out = wave_out.view(B, self.num_heads, 2, -1)  
-            # wave_out[:, :, 0, :] => approx filter portion
-            # wave_out[:, :, 1, :] => detail filter portion
-            wave_mod_approx = wave_out[:, :, 0, :]  # (B, num_heads, wavelet_len)
-            wave_mod_detail = wave_out[:, :, 1, :]  # (B, num_heads, wavelet_len)
-
-            wave_mod_approx = wave_mod_approx.unsqueeze(-1)  # => (B, num_heads, wavelet_len, 1)
-            wave_mod_detail = wave_mod_detail.unsqueeze(-1)  # => (B, num_heads, wavelet_len, 1)
-
-            filter_wavelet_approx = (
-                self.base_filter_wavelet_approx.unsqueeze(0)[:, :, : wave_approx.size(2), :] + wave_mod_approx
-            )  
-            filter_wavelet_detail = (
-                self.base_filter_wavelet_detail.unsqueeze(0)[:, :, : wave_detail.size(2), :] + wave_mod_detail
-            )
+        # ---- (3) Combine local/global ----
+        if self.combine_mode == 'gate':
+            # Gate in [0,1] after a sigmoid
+            alpha = torch.sigmoid(self.gate_param)
+            # Blend wavelet and FFT features
+            x_combined = alpha * x_wavelet + (1.0 - alpha) * x_fft
         else:
-            # Static base filters, slice them to the current wavelet_len
-            filter_wavelet_approx = self.base_filter_wavelet_approx.unsqueeze(0)[:, :, : wave_approx.size(2), :]
-            filter_wavelet_detail = self.base_filter_wavelet_detail.unsqueeze(0)[:, :, : wave_detail.size(2), :]
+            # Concatenate along the embedding dimension
+            # First, reshape each to (B, seq_len, num_heads*head_dim) = (B, N, D)
+            x_wavelet_reshaped = x_wavelet.permute(0, 2, 1, 3).reshape(B, N, D)
+            x_fft_reshaped     = x_fft.permute(0, 2, 1, 3).reshape(B, N, D)
+            x_cat = torch.cat([x_wavelet_reshaped, x_fft_reshaped], dim=-1)  # (B, N, 2*D)
+            # Project back down to D
+            x_combined = self.proj_concat(x_cat)
+            # Reshape back to (B, num_heads, seq_len, head_dim) if we want to keep the same path
+            x_combined = x_combined.view(B, N, -1).view(B, N, self.num_heads, self.head_dim)
+            # Permute back to (B, num_heads, seq_len, head_dim)
+            x_combined = x_combined.permute(0, 2, 1, 3)
 
-        # Apply wavelet filters
-        wave_approx = wave_approx * filter_wavelet_approx  # (B, num_heads, wavelet_len, head_dim)
-        wave_detail = wave_detail * filter_wavelet_detail  # (B, num_heads, wavelet_len, head_dim)
-
-        # Optional nonlinearity on wavelet coefficients
-        wave_approx = F.gelu(wave_approx)
-        wave_detail = F.gelu(wave_detail)
-
-        # Inverse wavelet
-        # => first restore shape to (B*num_heads*head_dim, wavelet_len)
-        wave_approx = wave_approx.permute(0, 1, 3, 2).reshape(
-            B * self.num_heads * self.head_dim, -1
-        )
-        wave_detail = wave_detail.permute(0, 1, 3, 2).reshape(
-            B * self.num_heads * self.head_dim, -1
-        )
-
-        x_wave_flat = self.wavelet_inverse(wave_approx, wave_detail, pad_len=pad_len)
-        # => shape (B*num_heads*head_dim, seq_len)
-        x_wave = x_wave_flat.view(B, self.num_heads, self.head_dim, N)
-        x_wave = x_wave.permute(0, 3, 1, 2).reshape(B, N, D)
-
-        # 3) Fuse global (FFT) and local (Wavelet) paths
-        # ---------------------------------------------
-        if self.fuse_method == "gating":
-            # A simple learned scalar gate alpha in [-∞, +∞], we apply sigmoid to keep it in [0,1].
-            alpha = torch.sigmoid(self.alpha)
-            x_fused = alpha * x_fft + (1.0 - alpha) * x_wave
-        else:
-            # Concat along the embedding dimension => (B, N, 2*D), then project back to (B, N, D)
-            x_fused = torch.cat([x_fft, x_wave], dim=-1)
-            x_fused = self.proj_concat(x_fused)
-
-        # 4) Residual connection + dropout + layernorm
-        return self.norm(x + self.dropout(x_fused))
+        # ---- (4) Reshape + dropout + residual ----
+        # Merge heads back into the embedding dimension
+        x_out = x_combined.permute(0, 2, 1, 3).reshape(B, N, D)
+        return x + self.dropout(x_out)
 
 
 class TransformerEncoderBlock(nn.Module):
-    def __init__(self, embed_dim, mlp_ratio=4.0, dropout=0.1, attention_module=None):
+    def __init__(self, embed_dim, mlp_ratio=4.0, dropout=0.1, attention_module=None, drop_path=0.0):
         """
-        A generic Transformer encoder block.
+        A generic Transformer encoder block with integrated drop path (stochastic depth).
           - embed_dim: embedding dimension.
           - mlp_ratio: expansion factor for the MLP.
           - dropout: dropout rate.
-          - attention_module: a module handling self-attention (or spectral attention).
+          - attention_module: a module handling self-attention (or spectral attention, etc.).
+          - drop_path: drop path rate for stochastic depth.
         """
         super().__init__()
         if attention_module is None:
@@ -301,13 +257,15 @@ class TransformerEncoderBlock(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
-            nn.Dropout(dropout),
+            nn.Dropout(dropout)
         )
         self.norm = nn.LayerNorm(embed_dim)
+        # Drop path layer for stochastic depth
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x):
-        # First, do the multi-head spectral/wavelet-based attention step
-        x_attn = self.attention(x)  # (B, seq_len, embed_dim)
-        # Then, pass the result through an MLP
-        x_out = x_attn + self.mlp(self.norm(x_attn))
-        return x_out
+        # (1) Attention + drop path
+        x = x + self.drop_path(self.attention(x))
+        # (2) MLP (after layer norm) + drop path
+        x = x + self.drop_path(self.mlp(self.norm(x)))
+        return x
