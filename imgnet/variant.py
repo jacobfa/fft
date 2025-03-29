@@ -8,23 +8,28 @@ from ptflops import get_model_complexity_info
 from fftnet_vit import FFTNetViT
 from transformer import ViT
 
-# Set the plotting style and attractive Seaborn palette.
+# Set the plotting style and an attractive Seaborn palette.
 plt.style.use(['science', 'no-latex', 'ieee'])
 # We'll use fixed colors for each variant type.
 variant_colors = {"Base": "red", "Large": "blue", "Huge": "black"}
 sns.set_palette(sns.color_palette(list(variant_colors.values())))
 
-# Set up logging: both console and file output.
+# -----------------------------------------------------------------------------
+# Setup logging to console and to a main "log.txt" file.
+# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("model_metrics.log", mode='w')
+        logging.FileHandler("log.txt", mode='w')  # <--- changed from "model_metrics.log"
     ]
 )
 logger = logging.getLogger()
 
+# -----------------------------------------------------------------------------
+# Helper functions for computing and formatting FLOPs, params, and latency.
+# -----------------------------------------------------------------------------
 def compute_metrics(model, input_res=(3, 224, 224)):
     """
     Compute the GMACs and parameter counts using ptflops.
@@ -107,6 +112,9 @@ def measure_all_latencies_for_batch_sizes(fftnet_variants, vit_variants, device,
             latencies[key][bs] = avg_time  # seconds
     return latencies
 
+# -----------------------------------------------------------------------------
+# Plotting functions
+# -----------------------------------------------------------------------------
 def plot_combined_latency_vs_batch_size(fftnet_variants, vit_variants, latencies, batch_sizes):
     """
     Plots average inference latency (ms) versus batch size for corresponding
@@ -157,7 +165,7 @@ def plot_throughput_vs_batch_size(fftnet_variants, vit_variants, latencies, batc
         fft_key = f"FFTNetViT {variant_type}"
         vit_key = f"ViT {variant_type}"
         
-        if fft_key in fftnet_variants and vit_key in vit_variants:
+        if fft_key in fft_variants and vit_key in vit_variants:
             # FFTNet throughput
             thpt_fft = []
             # ViT throughput
@@ -165,8 +173,8 @@ def plot_throughput_vs_batch_size(fftnet_variants, vit_variants, latencies, batc
             
             for bs in batch_sizes:
                 # Throughput = batch_size / latency_in_seconds
-                t_fft = batch_sizes[batch_sizes.index(bs)] / latencies[fft_key][bs]
-                t_vit = batch_sizes[batch_sizes.index(bs)] / latencies[vit_key][bs]
+                t_fft = bs / latencies[fft_key][bs]
+                t_vit = bs / latencies[vit_key][bs]
                 thpt_fft.append(t_fft)
                 thpt_vit.append(t_vit)
             
@@ -216,6 +224,9 @@ def plot_speedup_vs_batch_size(fftnet_variants, vit_variants, latencies, batch_s
     plt.close()
     logger.info("Saved speedup comparison plot: combined_speedup_comparison.pdf")
 
+# -----------------------------------------------------------------------------
+# Main routine
+# -----------------------------------------------------------------------------
 def main():
     # Determine device: use GPU if available, else CPU.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -297,11 +308,15 @@ def main():
         }
     }
     
+    # -------------------------------------------------------------------------
     # Evaluate and log metrics (FLOPs, Params, and latency for batch size = 1).
+    # -------------------------------------------------------------------------
     logger.info("Evaluating FFTNetViT and Standard ViT Variants (Batch Size 1):")
     for key, config in {**fftnet_variants, **vit_variants}.items():
         family = "FFTNetViT" if "FFTNet" in key else "ViT"
-        model = (FFTNetViT if family == "FFTNetViT" else ViT)(**config).to(device)
+        model_cls = FFTNetViT if family == "FFTNetViT" else ViT
+        model = model_cls(**config).to(device)
+
         flops, params = compute_metrics(model, input_res=(3, 224, 224))
         flops_str, params_str = format_metrics(flops, params)
         logger.info(f"{key} - FLOPs: {flops_str}, Params: {params_str}")
@@ -313,18 +328,67 @@ def main():
         logger.info(f"{key} - Average Latency (batch size 1): {avg_latency * 1000:.2f} ms")
         logger.info("-" * 50)
     
-    # Now measure latencies for a range of batch sizes for all variants
+    # -------------------------------------------------------------------------
+    # Now measure latencies for a range of batch sizes for all variants.
+    # -------------------------------------------------------------------------
     batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128]
-    latencies_dict = measure_all_latencies_for_batch_sizes(fftnet_variants, vit_variants, device, batch_sizes)
+    latencies_dict = measure_all_latencies_for_batch_sizes(
+        fftnet_variants, vit_variants, device, batch_sizes
+    )
     
-    # Generate combined latency vs batch size comparison plot.
+    # -------------------------------------------------------------------------
+    # Write raw latency, throughput, and speedup data to separate text files.
+    # -------------------------------------------------------------------------
+    with open("latency.txt", "w") as lat_file, \
+         open("throughput.txt", "w") as thr_file, \
+         open("speedup.txt", "w") as spd_file:
+        
+        # Header lines
+        lat_file.write("Model, BatchSize, AvgLatencySeconds\n")
+        thr_file.write("Model, BatchSize, Throughput_imgsPerSec\n")
+        spd_file.write("ModelVariant, BatchSize, Speedup(ViT/FFTNet)\n")
+        
+        # We'll compute throughput and speedup while traversing all data.
+        # Throughput is easy: (batch_size / latency_in_seconds).
+        # Speedup: ratio = (ViT latency) / (FFTNet latency).
+        
+        # We want to do it in pairs: each FFTNetViT variant and its corresponding ViT variant.
+        # We'll just loop over the entire latencies_dict and compute throughput for each,
+        # and speedup for pairs of FFTNet vs. ViT for the same "Base"/"Large"/"Huge".
+        
+        # First, log all latencies (for both FFTNetViT and ViT).
+        for model_key, batch_dict in latencies_dict.items():
+            for bs, lat in batch_dict.items():
+                lat_file.write(f"{model_key}, {bs}, {lat:.6f}\n")
+                thr_file.write(f"{model_key}, {bs}, {bs/lat:.3f}\n")
+        
+        # Now compute speedup for matching pairs (ViT X vs FFTNetViT X).
+        # We'll do that by grouping them by variant_type = "Base", "Large", "Huge".
+        # Then look up latencies in latencies_dict.
+        variant_names = ["Base", "Large", "Huge"]
+        
+        for vt in variant_names:
+            fft_key = f"FFTNetViT {vt}"
+            vit_key = f"ViT {vt}"
+            
+            # Make sure both are in latencies_dict
+            if fft_key in latencies_dict and vit_key in latencies_dict:
+                # For each batch size in our known list
+                for bs in batch_sizes:
+                    lat_fft = latencies_dict[fft_key][bs]
+                    lat_vit = latencies_dict[vit_key][bs]
+                    ratio = lat_vit / lat_fft
+                    spd_file.write(f"{vt}, {bs}, {ratio:.3f}\n")
+    
+    # -------------------------------------------------------------------------
+    # Generate the combined plots (latency, throughput, speedup).
+    # -------------------------------------------------------------------------
     plot_combined_latency_vs_batch_size(fftnet_variants, vit_variants, latencies_dict, batch_sizes)
-    
-    # Generate throughput vs batch size plot.
     plot_throughput_vs_batch_size(fftnet_variants, vit_variants, latencies_dict, batch_sizes)
-    
-    # Generate speedup vs batch size plot.
     plot_speedup_vs_batch_size(fftnet_variants, vit_variants, latencies_dict, batch_sizes)
 
+# -----------------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
