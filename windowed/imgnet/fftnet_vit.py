@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from fftnet_modules import MultiScaleSpectralAttention, TransformerEncoderBlock
+from fftnet_modules import MultiHeadSpectralWaveletAttention, TransformerEncoderBlock
 
 class PatchEmbed(nn.Module):
     def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=192):
@@ -58,7 +58,7 @@ class FFTNetViT(nn.Module):
         # Build Transformer encoder blocks
         self.blocks = nn.ModuleList()
         for _ in range(depth):
-            spectral_attn = MultiScaleSpectralAttention(
+            spectral_attn = MultiHeadSpectralWaveletAttention(
                 embed_dim=embed_dim,
                 seq_len=n_patches + 1,  # #tokens = n_patches + 1 (includes cls token)
                 num_heads=num_heads,
