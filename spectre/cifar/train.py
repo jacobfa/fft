@@ -64,10 +64,10 @@ def cifar10_loaders(data_root: Path, batch: int, workers: int = 4) -> tuple[Data
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, amp: bool) -> float:
     model.eval()
     top1_sum, n_samples = 0.0, 0
-    scaler_ctx = torch.cuda.amp.autocast if amp else torch.autocast  # type: ignore
+    scaler_ctx = torch.amp.autocast if amp else torch.autocast  # type: ignore
     for x, y in loader:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        with scaler_ctx():
+        with scaler_ctx(device_type="cuda", enabled=amp):
             logits = model(x)
         top1 = accuracy(logits, y, topk=(1,))[0]
         top1_sum += top1.item() * x.size(0)
@@ -91,7 +91,7 @@ def train_one_epoch(model: nn.Module,
     for it, (x, y) in enumerate(pbar):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=amp):
+        with torch.amp.autocast(device_type="cuda", enabled=amp):
             logits = model(x)
             loss = criterion(logits, y)
 
@@ -122,7 +122,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=10, help="warm‑up epochs")
     p.add_argument("--workers", type=int, default=os.cpu_count() or 4)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--amp", action="store_true", default=True, help="mixed precision")
+    p.add_argument("--amp", action="store_true", default=False, help="mixed precision")
     p.add_argument("--save_dir", type=Path, default=Path("./checkpoints"))
     return p.parse_args()
 
@@ -161,7 +161,7 @@ def main() -> None:
     # Criterion, AMP, misc.
     # ----------------------------------------------------------------
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    scaler = torch.amp.GradScaler(enabled=args.amp)
 
     best_acc = 0.0
     for epoch in range(1, args.epochs + 1):
