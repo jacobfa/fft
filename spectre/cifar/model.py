@@ -1,11 +1,3 @@
-# model.py  ───────────────────────────────────────────────────────────────────
-"""
-Vision Transformer with SPECTRE token mixer, sized for CIFAR‑10 (32 × 32 RGB),
-augmented with **stochastic depth** (a.k.a. DropPath).
-
-Place `spectre.py` in the same directory.  No training / main code included.
-"""
-
 from __future__ import annotations
 import math
 import torch
