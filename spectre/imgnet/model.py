@@ -15,7 +15,7 @@ try:
 except ImportError as e:
     raise ImportError(
         "pytorch_wavelets not found – `pip install pytorch_wavelets`"
-    ) from e  # library gives 1‑D DWT wrappers ✱&#8203;:contentReference[oaicite:0]{index=0}
+    ) from e 
 
 # --------------------------------------------------------------------- #
 #                          SPECTRE Attention Block                      #
