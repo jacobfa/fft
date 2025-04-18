@@ -181,8 +181,8 @@ def main():
 
     # Model creation and wrapping for distributed training.
     if args.model.lower() == 'fftnet_vit':
-        from model import VisionTransformer
-        model = VisionTransformer().to(device)
+        from model import SpectreViT
+        model = SpectreViT().to(device)
     else:
         import timm
         model = timm.create_model(
