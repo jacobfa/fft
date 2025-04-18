@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""
-Train a Vision Transformer with SPECTRE‑RFFT token mixer on CIFAR‑10
-===================================================================
-
-Usage
------
-$ python train.py --epochs 200 --batch-size 128 --lr 5e-4 --data ~/datasets
-
-This script expects `model.py` containing the `ViTSpectreCIFAR10` class in
-its parent directory or the Python path. Progress is displayed with `tqdm`.
-"""
 from __future__ import annotations
 import argparse
 import math
