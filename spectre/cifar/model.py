@@ -236,20 +236,3 @@ class SpectreViT(nn.Module):
             x = blk(x)
         x = self.norm(x)
         return self.head(x[:, 0])                        # CLS token
-
-# ---------------------------------------------------------------------
-# Convenience builder
-# ---------------------------------------------------------------------
-def build_spectre_vit(
-    *,
-    device: str = "cuda",
-    compile: bool = _HAS_COMPILE,
-    **kwargs,
-) -> SpectreViT:
-    r"""Factory that moves model to `device` and optionally compiles it."""
-    model = SpectreViT(**kwargs).to(device)
-    if compile:
-        # `reduce-overhead` gives best speed for inference;
-        # use `default` for training.
-        model = torch.compile(model, mode="reduce-overhead", backend="inductor")  # type: ignore[arg-type]
-    return model
