@@ -1,259 +1,219 @@
-from __future__ import annotations
-from typing import List, Tuple
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.fft import rfft, irfft
+from typing import Optional, Tuple, List
 
-# --------------------------------------------------------------------- #
-#                          utility: DropPath                            #
-# --------------------------------------------------------------------- #
-def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False):
-    """Per‑sample stochastic depth (identical to timm implementation)."""
-    if drop_prob == 0.0 or not training:
-        return x
-    keep_prob = 1 - drop_prob
-    shape = (x.shape[0],) + (1,) * (x.ndim - 1)          # broadcast
-    rand = torch.rand(shape, dtype=x.dtype, device=x.device)
-    mask = rand < keep_prob
-    return x * mask / keep_prob
+try:
+    from pytorch_wavelets import DWT1DForward, DWT1DInverse  # type: ignore
+except ImportError:  # graceful degradation when wavelet lib is missing
+    DWT1DForward = DWT1DInverse = None  # pragma: no cover
 
-
+# -----------------------------------------------------------------------------
+# Regularisation helpers
+# -----------------------------------------------------------------------------
 class DropPath(nn.Module):
-    def __init__(self, drop_prob: float = 0.0):
+    """Stochastic depth per sample (a.k.a. DropPath) as in Huang et al. 2016.
+    Copied from timm with minimal deps to avoid external requirement.
+    """
+    def __init__(self, drop_prob: float = 0.0) -> None:
         super().__init__()
         self.drop_prob = drop_prob
 
-    def forward(self, x):
-        return drop_path(x, self.drop_prob, self.training)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # broadcast over all dims
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binarise
+        return x.div(keep_prob) * random_tensor
 
+# -----------------------------------------------------------------------------
+# SPECTRE Mixer
+# -----------------------------------------------------------------------------
+class SpectreMix(nn.Module):
+    """SPECTRE mixing layer – drop‑in replacement for multi‑head self‑attention.
 
-# --------------------------------------------------------------------- #
-#                    differentiable DWT/iDWT from the lib               #
-# --------------------------------------------------------------------- #
-try:
-    from pytorch_wavelets import DWT1DForward, DWT1DInverse  # ≥ 1.0.0
-except ImportError as e:
-    raise ImportError("pytorch_wavelets not found – `pip install pytorch_wavelets`") from e
-
-# --------------------------------------------------------------------- #
-#                          SPECTRE Attention Block                      #
-# --------------------------------------------------------------------- #
-class SPECTREAttention(nn.Module):
+    Args:
+        dim: embedding dimension
+        n_heads: number of heads
+        wavelets: enable wavelet refinement
+        levels: wavelet decomposition levels (ignored if wavelets=False)
+        wavelet: wavelet family string, e.g. "db4", "haar"
     """
-    Frequency‑domain mixer (§ Method).  WRM uses pytorch_wavelets.
-    """
 
-    def __init__(
-        self,
-        dim: int,
-        heads: int = 8,
-        wavelet: bool = False,
-        wavelet_levels: int = 1,
-    ):
+    def __init__(self, dim: int, n_heads: int = 12, *, wavelets: bool = False,
+                 levels: int = 3, wavelet: str = "db4") -> None:
         super().__init__()
-        assert dim % heads == 0, "dim must be divisible by heads"
-        self.dim = dim
-        self.heads = heads
-        self.dh = dim // heads
+        assert dim % n_heads == 0, "dim must be divisible by n_heads"
+        self.dim, self.n_heads, self.dh = dim, n_heads, dim // n_heads
+        self.levels = levels
 
-        # projections
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
+        # linear projections
+        self.Wq = nn.Linear(dim, dim, bias=False)
+        self.Wv = nn.Linear(dim, dim, bias=False)
+        self.proj = nn.Linear(dim, dim)
 
-        # spectral gates
-        self.ln_qbar = nn.LayerNorm(self.dh)
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(self.dh, self.dh),
+        # 2‑layer complex gate MLP
+        self.gate = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim * 2),
             nn.GELU(),
-            nn.Linear(self.dh, 2),
+            nn.Linear(dim * 2, n_heads * ((self.dh // 2) + 1) * 2),
         )
 
-        # wavelet refinement
-        self.wavelet = wavelet
-        if self.wavelet:
-            self.w_levels = wavelet_levels
-            self.wmlp = nn.Sequential(
-                nn.Linear(self.dh, self.dh),
+        # wavelet refinement (optional)
+        self.use_wavelets = wavelets and DWT1DForward is not None
+        if self.use_wavelets:
+            self.dwt = DWT1DForward(J=levels, wave=wavelet, mode="zero")
+            self.idwt = DWT1DInverse(wave=wavelet, mode="zero")
+            self.w_gate = nn.Sequential(
+                nn.LayerNorm(dim),
+                nn.Linear(dim, dim // 2),
                 nn.GELU(),
-                nn.Linear(self.dh, self.w_levels),
+                nn.Linear(dim // 2, levels),
             )
-            self.dwt = DWT1DForward(J=self.w_levels, mode="zero", wave="haar")
-            self.idwt = DWT1DInverse(mode="zero", wave="haar")
 
-    # ------------------------------------------------------------------ #
-    def _complex_gate(self, qbar: torch.Tensor, N: int) -> torch.Tensor:
-        g_logits = self.gate_mlp(qbar).unsqueeze(1).repeat_interleave(N, 1)
-        return torch.view_as_complex(g_logits)  # (B*H, N)
-
-    # ------------------------------------------------------------------ #
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B,N,dim)
+    # ---------------------------------------------------------------------
+    # forward
+    # ---------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, N, D)
         B, N, _ = x.shape
-        H, dh = self.heads, self.dh
+        q = self.Wq(x)                                   # (B, N, D)
+        v = self.Wv(x)
 
-        q = self.q_proj(x)
-        v = self.v_proj(x)
+        # reshape to (B, h, N, dh)
+        v = v.reshape(B, N, self.n_heads, self.dh).transpose(1, 2)
 
-        q = q.view(B, N, H, dh).transpose(1, 2).reshape(B * H, N, dh)
-        v = v.view(B, N, H, dh).transpose(1, 2).reshape(B * H, N, dh)
+        # FFT along sequence dimension
+        Vf = rfft(v, dim=-2, norm="ortho")              # (B, h, Nf, dh)
+        Nf = Vf.size(-2)
 
-        qbar = self.ln_qbar(q.mean(1))
+        # spectral gates from pooled queries
+        q_pool = q.mean(dim=1)                           # (B, D)
+        g = self.gate(q_pool).view(B, self.n_heads, Nf, 2)
+        g = torch.view_as_complex(g)                     # (B, h, Nf)
 
-        v_hat = torch.fft.fft(v, dim=1)
-        g = self._complex_gate(qbar, N).unsqueeze(-1)
-        v_hat = v_hat * g
-        v_tilde = torch.fft.ifft(v_hat, dim=1).real
+        Vf = Vf * g.unsqueeze(-1)
+        v_t = irfft(Vf, n=N, dim=-2, norm="ortho")      # (B, h, N, dh)
 
-        if self.wavelet:
-            v_tilde = self._wavelet_refinement(v_tilde, qbar)
+        # Wavelet refinement
+        if self.use_wavelets:
+            yl, yh = self.dwt(v_t)                       # low‑pass, highs list
+            gate = torch.sigmoid(self.w_gate(q_pool)).view(B, 1, self.levels, 1, 1)
+            yh = [yh_l * gate[..., i] for i, yh_l in enumerate(yh)]
+            v_t = self.idwt((yl, yh))
 
-        v_tilde = (
-            v_tilde.reshape(B, H, N, dh).transpose(1, 2).reshape(B, N, self.dim)
-        )
-        return self.out_proj(v_tilde)
+        # merge heads and project out
+        v_t = v_t.transpose(1, 2).reshape(B, N, self.dim)
+        return self.proj(v_t)
 
-    # ------------------------------------------------------------------ #
-    #                   Wavelet Refinement Module (WRM)                  #
-    # ------------------------------------------------------------------ #
-    def _wavelet_refinement(self, x: torch.Tensor, qbar: torch.Tensor):
-        B_H, N, dh = x.shape
-        cls, tokens = x[:, :1, :], x[:, 1:, :]          # CLS + 64
-
-        tokens_t = tokens.transpose(1, 2)               # (B*H, dh, 64)
-        yl, yh = self.dwt(tokens_t)
-
-        gates = torch.sigmoid(self.wmlp(qbar))          # (B*H, levels)
-        gated_yh = [
-            band * gates[:, i : i + 1].unsqueeze(-1) for i, band in enumerate(yh)
-        ]
-
-        recon = self.idwt((yl, gated_yh)).transpose(1, 2)  # (B*H, 64, dh)
-        return torch.cat([cls, tokens + recon], dim=1)
-
-
-# --------------------------------------------------------------------- #
-#                 Standard Transformer Encoder Block                    #
-# --------------------------------------------------------------------- #
-class TransformerEncoderBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        heads: int = 8,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.1,
-        drop_path: float = 0.0,
-        wavelet: bool = False,
-        wavelet_levels: int = 1,
-        init_values: float | None = None,   # LayerScale γ initial value
-    ):
+# -----------------------------------------------------------------------------
+# Patch embedding
+# -----------------------------------------------------------------------------
+class PatchEmbed(nn.Module):
+    def __init__(self, img_size: int = 224, patch: int = 16, dim: int = 768) -> None:
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.mix = SPECTREAttention(
-            dim, heads, wavelet=wavelet, wavelet_levels=wavelet_levels
-        )
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, int(dim * mlp_ratio)),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(int(dim * mlp_ratio), dim),
-            nn.Dropout(dropout),
-        )
+        self.proj = nn.Conv2d(3, dim, kernel_size=patch, stride=patch)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        n_patches = (img_size // patch) ** 2
+        self.pos = nn.Parameter(torch.zeros(1, n_patches + 1, dim))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
 
-        self.drop_path1 = DropPath(drop_path)
-        self.drop_path2 = DropPath(drop_path)
-
-        # LayerScale parameters (if requested)
-        if init_values is not None and init_values > 0:
-            self.gamma1 = nn.Parameter(init_values * torch.ones(dim))
-            self.gamma2 = nn.Parameter(init_values * torch.ones(dim))
-        else:
-            self.gamma1 = self.gamma2 = None
-
-    # ------------------------------------------------------------------ #
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.gamma1 is None:
-            x = x + self.drop_path1(self.mix(self.norm1(x)))
-            x = x + self.drop_path2(self.mlp(self.norm2(x)))
-        else:
-            x = x + self.drop_path1(self.gamma1 * self.mix(self.norm1(x)))
-            x = x + self.drop_path2(self.gamma2 * self.mlp(self.norm2(x)))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, 3, H, W)
+        B = x.shape[0]
+        x = self.proj(x).flatten(2).transpose(1, 2)      # (B, N, D)
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls, x), dim=1) + self.pos
         return x
 
-
-# --------------------------------------------------------------------- #
-#                      Vision Transformer backbone                      #
-# --------------------------------------------------------------------- #
-class VisionTransformer(nn.Module):
-    def __init__(
-        self,
-        img_size: int = 224,
-        patch_size: int = 16,
-        in_chans: int = 3,
-        num_classes: int = 1000,
-        dim: int = 768,
-        depth: int = 12,
-        heads: int = 12,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.1,
-        drop_path_rate: float = 0.0,
-        wavelet: bool = True,
-        wavelet_levels: int = 2,
-        init_values: float | None = None,  # LayerScale
-    ):
+# -----------------------------------------------------------------------------
+# Transformer block with SPECTRE + MLP + LayerScale + DropPath
+# -----------------------------------------------------------------------------
+class SpectreBlock(nn.Module):
+    def __init__(self, dim: int, heads: int, drop_path: float = 0.0,
+                 mlp_ratio: int = 4, wavelets: bool = False,
+                 levels: int = 3, layer_scale_init: float = 1e-5) -> None:
         super().__init__()
-        assert img_size % patch_size == 0
-        self.patch_embed = nn.Conv2d(
-            in_chans, dim, kernel_size=patch_size, stride=patch_size
+        self.norm1 = nn.LayerNorm(dim)
+        self.mix = SpectreMix(dim, heads, wavelets=wavelets, levels=levels)
+        self.ls1 = nn.Parameter(layer_scale_init * torch.ones(dim), requires_grad=True)
+        self.drop1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(dim * mlp_ratio, dim),
         )
-        num_patches = (img_size // patch_size) ** 2
+        self.ls2 = nn.Parameter(layer_scale_init * torch.ones(dim), requires_grad=True)
+        self.drop2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
-        self.pos_embed = nn.Parameter(torch.randn(1, num_patches + 1, dim) * 0.02)
-        self.pos_drop = nn.Dropout(dropout)
-
-        # stochastic‑depth decay rule (0 → drop_path_rate)
-        dpr = [drop_path_rate * i / (depth - 1) for i in range(depth)]
-
-        self.blocks = nn.ModuleList(
-            [
-                TransformerEncoderBlock(
-                    dim,
-                    heads,
-                    mlp_ratio,
-                    dropout,
-                    drop_path=dpr[i],
-                    wavelet=wavelet,
-                    wavelet_levels=wavelet_levels,
-                    init_values=init_values,
-                )
-                for i in range(depth)
-            ]
-        )
-        self.norm = nn.LayerNorm(dim)
-        self.head = nn.Linear(dim, num_classes)
-
-        self._init_weights()
-
-    # ------------------------------------------------------------------ #
-    def _init_weights(self):
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        nn.init.trunc_normal_(self.head.weight, std=0.02)
-        nn.init.constant_(self.head.bias, 0)
-
-    # ------------------------------------------------------------------ #
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B = x.shape[0]
-        x = self.patch_embed(x).flatten(2).transpose(1, 2)  # (B,N,D)
+        x = x + self.drop1(self.ls1 * self.mix(self.norm1(x)))
+        x = x + self.drop2(self.ls2 * self.mlp(self.norm2(x)))
+        return x
 
-        cls = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls, x), 1)
-        x = self.pos_drop(x + self.pos_embed)
+# -----------------------------------------------------------------------------
+# Vision Transformer with SPECTRE
+# -----------------------------------------------------------------------------
+class SpectreViT(nn.Module):
+    """Vision Transformer backbone with SPECTRE mixers.
 
+    Args:
+        img_size: input resolution (square assumed)
+        patch: patch size
+        dim: embedding dimension
+        depth: number of encoder blocks
+        heads: number of heads per block
+        num_classes: classification classes
+        wavelets: enable wavelet module
+        levels: wavelet levels
+        drop_path_rate: maximum stochastic depth rate (linearly scaled)
+        mlp_ratio: hidden expansion in feed‑forward
+        layer_scale_init: LayerScale initial value (0 disables LayerScale)
+    """
+
+    def __init__(self, *, img_size: int = 224, patch: int = 16, dim: int = 768,
+                 depth: int = 12, heads: int = 12, num_classes: int = 1000,
+                 wavelets: bool = False, levels: int = 3,
+                 drop_path_rate: float = 0.1, mlp_ratio: int = 4,
+                 layer_scale_init: float = 1e-5) -> None:
+        super().__init__()
+        self.patch_embed = PatchEmbed(img_size, patch, dim)
+
+        # stochastic depth decay rule
+        dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        self.blocks = nn.ModuleList([
+            SpectreBlock(dim, heads, dp_rates[i], mlp_ratio, wavelets, levels, layer_scale_init)
+            for i in range(depth)
+        ])
+
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, num_classes) if num_classes > 0 else nn.Identity()
+
+        # weight init (trunc normal for linear layers)
+        self.apply(self._init_weights)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _init_weights(m) -> None:  # noqa: N805
+        if isinstance(m, (nn.Linear, nn.Conv2d)):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.zeros_(m.bias)
+            nn.init.ones_(m.weight)
+
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B,3,H,W)
+        x = self.patch_embed(x)
         for blk in self.blocks:
             x = blk(x)
-
         x = self.norm(x)
-        return self.head(x[:, 0])
+        cls = x[:, 0]  # CLS token
+        return self.head(cls)
