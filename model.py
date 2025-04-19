@@ -43,8 +43,9 @@ class SpectreBlock(nn.Module):
         self.mix = SpectreMix(
             dim=dim,
             heads=heads,
-            max_seq=max_seq_len,
-            wrm=True
+            max_seq_len=max_seq_len,
+            enable_wrm=True,
+            wrm_skip_ratio=wrm_skip_ratio,
         )
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, int(dim * mlp_ratio), drop)
@@ -141,3 +142,94 @@ class SpectreViT(nn.Module):
         x = self.norm(x)
         cls_out = x[:, 0]
         return self.head(cls_out)
+
+
+class SpectreLM(nn.Module):
+    """Causal Language Model using SPECTRE token mixing."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        max_seq_len: int = 1024,
+        embed_dim: int = 768,
+        depth: int = 12,
+        heads: int = 12,
+        mlp_ratio: float = 4.0,
+        drop_rate: float = 0.0,
+        wrm_skip_ratio: float = 0.9,
+        tie_weights: bool = True,
+    ) -> None:
+        """Create a SpectreLM model.
+
+        Args:
+            vocab_size: Size of the input/output vocabulary.
+            max_seq_len: Maximum sequence length the model will handle.
+            embed_dim: Embedding dimension (also the hidden size).
+            depth: Number of Spectre blocks.
+            heads: Number of attention heads in SpectreMix.
+            mlp_ratio: Expansion ratio for the feed‑forward network.
+            drop_rate: Dropout rate applied after embeddings and within MLPs.
+            wrm_skip_ratio: Ratio controlling windowed receptive masking in SpectreMix.
+            tie_weights: If True, use the same weights for the input token embeddings and the output LM head.
+        """
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.token_embed = nn.Embedding(vocab_size, embed_dim)
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, embed_dim))
+        self.pos_drop = nn.Dropout(drop_rate)
+
+        self.blocks = nn.ModuleList(
+            [
+                SpectreBlock(
+                    dim=embed_dim,
+                    heads=heads,
+                    max_seq_len=max_seq_len,
+                    mlp_ratio=mlp_ratio,
+                    drop=drop_rate,
+                    wrm_skip_ratio=wrm_skip_ratio,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+        self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
+
+        if tie_weights:
+            # Tie input embedding and output projection weights
+            self.lm_head.weight = self.token_embed.weight
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.token_embed.weight, std=0.02)
+        if self.lm_head.weight is not self.token_embed.weight:
+            nn.init.trunc_normal_(self.lm_head.weight, std=0.02)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            input_ids: Tensor of shape (B, L) containing token indices.
+
+        Returns:
+            Logits of shape (B, L, vocab_size).
+        """
+        B, L = input_ids.shape
+        if L > self.max_seq_len:
+            raise ValueError(
+                f"Input sequence length {L} exceeds model's maximum {self.max_seq_len}."
+            )
+
+        positions = torch.arange(0, L, dtype=torch.long, device=input_ids.device)
+        positions = positions.unsqueeze(0)  # (1, L)
+
+        x = self.token_embed(input_ids) + self.pos_embed[:, :L]
+        x = self.pos_drop(x)
+
+        for blk in self.blocks:
+            x = blk(x)
+
+        x = self.norm(x)
+        logits = self.lm_head(x)
+        return logits
