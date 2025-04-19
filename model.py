@@ -1,235 +1,179 @@
-import math
-from typing import Iterable, Optional
+from __future__ import annotations
 
+from math import sqrt, pi
 import torch
 import torch.nn as nn
 
-from spectre import SpectreMix  # assumes spectre.py is in PYTHONPATH or same dir
+inv_sqrt2 = 1 / sqrt(2.0)
 
 
-class MLP(nn.Module):
-    """Feed‑forward network used inside the Transformer block."""
+# ---------------------------------------------------------------------
+# Wavelet Refinement Module (handles odd sequence lengths gracefully)
+# ---------------------------------------------------------------------
 
-    def __init__(self, dim: int, hidden_dim: int, drop: float = 0.0):
+class WaveletRefinement(nn.Module):
+    """One‑level orthogonal Haar Wavelet Refinement Module (WRM).
+
+    * Skips execution when sequence length is odd (cannot decimate by 2).
+    * Uses channel‑wise gates from a small MLP.
+    """
+
+    def __init__(
+        self,
+        d_h: int,
+        max_seq_len: int,
+        dtype: torch.dtype = torch.float32,
+        skip_ratio: float = 0.9,
+    ) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(dim, hidden_dim)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_dim, dim)
-        self.drop = nn.Dropout(drop)
+        self.skip_ratio = skip_ratio
+        hidden = 4 * d_h
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(d_h, hidden, dtype=dtype),
+            nn.SiLU(),
+            nn.Linear(hidden, max_seq_len, dtype=dtype),
+            nn.Sigmoid(),
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
+    # Haar helpers ------------------------------------------------------
+    @staticmethod
+    def _dwt_haar(x: torch.Tensor) -> torch.Tensor:
+        low = (x[:, :, 0::2, :] + x[:, :, 1::2, :]) * inv_sqrt2
+        high = (x[:, :, 0::2, :] - x[:, :, 1::2, :]) * inv_sqrt2
+        return torch.cat([low, high], dim=2)
+
+    @staticmethod
+    def _idwt_haar(coeffs: torch.Tensor) -> torch.Tensor:
+        N_half = coeffs.shape[2] // 2
+        low, high = torch.split(coeffs, N_half, dim=2)
+        out = torch.empty_like(coeffs)
+        out[:, :, 0::2, :] = (low + high) * inv_sqrt2
+        out[:, :, 1::2, :] = (low - high) * inv_sqrt2
+        return out
+
+    # Forward -----------------------------------------------------------
+    def forward(self, x: torch.Tensor, bar_q: torch.Tensor) -> torch.Tensor:
+        B, H, N, d = x.shape
+
+        # Skip if odd sequence length or stochastic skip controller
+        if (N % 2 == 1) or (self.skip_ratio > 0 and torch.rand(1).item() < self.skip_ratio):
+            return x
+
+        w = self._dwt_haar(x)
+        gate = self.gate_mlp(bar_q.mean(dim=1))[:, :N]  # (B,N)
+        gate = gate.view(B, 1, N, 1)
+        w = w * gate
+        v_ref = self._idwt_haar(w)
+        return x + v_ref
 
 
-class SpectreBlock(nn.Module):
-    """Transformer block with SPECTRE mixing instead of MHSA."""
+# ---------------------------------------------------------------------
+# SPECTRE Token Mixing Layer
+# ---------------------------------------------------------------------
+
+class SpectreMix(nn.Module):
+    """Spectral Projection & Content‑adaptive Transformer Engine (SPECTRE)."""
 
     def __init__(
         self,
         dim: int,
-        heads: int,
-        max_seq_len: int,
-        mlp_ratio: float = 4.0,
-        drop: float = 0.0,
-        wrm_skip_ratio: float = 0.9,
-    ) -> None:
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.mix = SpectreMix(
-            dim=dim,
-            heads=heads,
-            max_seq_len=max_seq_len,
-            enable_wrm=True,
-            wrm_skip_ratio=wrm_skip_ratio,
-        )
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, int(dim * mlp_ratio), drop)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.mix(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-class PatchEmbed(nn.Module):
-    """Image to patch embedding."""
-
-    def __init__(self, img_size: int, patch_size: int, in_chans: int, embed_dim: int):
-        super().__init__()
-        self.patch_size = patch_size
-        self.proj = nn.Conv2d(
-            in_chans,
-            embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
-        )
-        num_patches = (img_size // patch_size) ** 2
-        self.num_patches = num_patches
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B,C,H,W)
-        x = self.proj(x)  # (B,embed_dim,H',W')
-        x = x.flatten(2).transpose(1, 2)  # (B,N,embed_dim)
-        return x
-
-
-class SpectreViT(nn.Module):
-    """Vision Transformer with SPECTRE token mixing optimised for CIFAR‑10."""
-
-    def __init__(
-        self,
-        img_size: int = 32,
-        patch_size: int = 4,
-        in_chans: int = 3,
-        num_classes: int = 10,
-        embed_dim: int = 256,
-        depth: int = 6,
         heads: int = 8,
-        mlp_ratio: float = 4.0,
-        drop_rate: float = 0.0,
+        max_seq_len: int = 2048,
+        gate_hidden: int | None = None,
+        use_phase: bool = True,
+        enable_wrm: bool = False,
         wrm_skip_ratio: float = 0.9,
+        dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
-        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
-        num_patches = self.patch_embed.num_patches
-        self.seq_len = num_patches + 1  # + cls token
+        assert dim % heads == 0, "`dim` must be divisible by `heads`."
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.seq_len, embed_dim))
-        self.pos_drop = nn.Dropout(drop_rate)
-
-        self.blocks = nn.ModuleList(
-            [
-                SpectreBlock(
-                    dim=embed_dim,
-                    heads=heads,
-                    max_seq_len=self.seq_len,
-                    mlp_ratio=mlp_ratio,
-                    drop=drop_rate,
-                    wrm_skip_ratio=wrm_skip_ratio,
-                )
-                for _ in range(depth)
-            ]
-        )
-        self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, num_classes)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        nn.init.trunc_normal_(self.head.weight, std=0.02)
-        if self.head.bias is not None:
-            nn.init.constant_(self.head.bias, 0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B,C,H,W)
-        B = x.shape[0]
-        x = self.patch_embed(x)  # (B,N,embed_dim)
-
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B,1,embed_dim)
-        x = torch.cat((cls_tokens, x), dim=1)  # (B,seq_len,embed_dim)
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
-
-        for blk in self.blocks:
-            x = blk(x)
-
-        x = self.norm(x)
-        cls_out = x[:, 0]
-        return self.head(cls_out)
-
-
-class SpectreLM(nn.Module):
-    """Causal Language Model using SPECTRE token mixing."""
-
-    def __init__(
-        self,
-        vocab_size: int,
-        max_seq_len: int = 1024,
-        embed_dim: int = 768,
-        depth: int = 12,
-        heads: int = 12,
-        mlp_ratio: float = 4.0,
-        drop_rate: float = 0.0,
-        wrm_skip_ratio: float = 0.9,
-        tie_weights: bool = True,
-    ) -> None:
-        """Create a SpectreLM model.
-
-        Args:
-            vocab_size: Size of the input/output vocabulary.
-            max_seq_len: Maximum sequence length the model will handle.
-            embed_dim: Embedding dimension (also the hidden size).
-            depth: Number of Spectre blocks.
-            heads: Number of attention heads in SpectreMix.
-            mlp_ratio: Expansion ratio for the feed‑forward network.
-            drop_rate: Dropout rate applied after embeddings and within MLPs.
-            wrm_skip_ratio: Ratio controlling windowed receptive masking in SpectreMix.
-            tie_weights: If True, use the same weights for the input token embeddings and the output LM head.
-        """
-        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.d_h = dim // heads
         self.max_seq_len = max_seq_len
-        self.token_embed = nn.Embedding(vocab_size, embed_dim)
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, embed_dim))
-        self.pos_drop = nn.Dropout(drop_rate)
+        self.n_freq_max = max_seq_len // 2 + 1
+        self.use_phase = use_phase
 
-        self.blocks = nn.ModuleList(
-            [
-                SpectreBlock(
-                    dim=embed_dim,
-                    heads=heads,
-                    max_seq_len=max_seq_len,
-                    mlp_ratio=mlp_ratio,
-                    drop=drop_rate,
-                    wrm_skip_ratio=wrm_skip_ratio,
-                )
-                for _ in range(depth)
-            ]
+        # Projections
+        self.q_proj = nn.Linear(dim, dim, bias=False, dtype=dtype)
+        self.v_proj = nn.Linear(dim, dim, bias=False, dtype=dtype)
+        self.out_proj = nn.Linear(dim, dim, bias=False, dtype=dtype)
+
+        # Gate MLP
+        gate_hidden = gate_hidden or 4 * self.d_h
+        self.norm = nn.LayerNorm(self.d_h, dtype=dtype)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(self.d_h, gate_hidden, dtype=dtype),
+            nn.SiLU(),
+            nn.Linear(gate_hidden, 2 * self.n_freq_max, dtype=dtype),
         )
-        self.norm = nn.LayerNorm(embed_dim)
-        self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
 
-        if tie_weights:
-            # Tie input embedding and output projection weights
-            self.lm_head.weight = self.token_embed.weight
+        if self.use_phase:
+            k = torch.arange(self.n_freq_max).float()
+            self.register_buffer("_freq_idx", k, persistent=False)
 
-        self._init_weights()
+        self.wrm = (
+            WaveletRefinement(self.d_h, max_seq_len, dtype=dtype, skip_ratio=wrm_skip_ratio)
+            if enable_wrm
+            else None
+        )
 
-    def _init_weights(self):
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.token_embed.weight, std=0.02)
-        if self.lm_head.weight is not self.token_embed.weight:
-            nn.init.trunc_normal_(self.lm_head.weight, std=0.02)
+    # Helper reshapes ---------------------------------------------------
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, _ = x.shape
+        return x.view(B, N, self.heads, self.d_h).transpose(1, 2)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
+    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, N, d = x.shape
+        return x.transpose(1, 2).contiguous().view(B, N, H * d)
 
-        Args:
-            input_ids: Tensor of shape (B, L) containing token indices.
+    # Forward -----------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B,N,D)
+        B, N, _ = x.shape
+        assert N <= self.max_seq_len, "Sequence length exceeds `max_seq_len`."
+        n_freq = N // 2 + 1
 
-        Returns:
-            Logits of shape (B, L, vocab_size).
-        """
-        B, L = input_ids.shape
-        if L > self.max_seq_len:
-            raise ValueError(
-                f"Input sequence length {L} exceeds model's maximum {self.max_seq_len}."
+        # 1) Project
+        q = self._split_heads(self.q_proj(x))
+        v = self._split_heads(self.v_proj(x))
+
+        # 2) FFT (upgrade to fp32 if needed for cuFFT)
+        needs_fp32_fft = v.dtype in (torch.float16, torch.bfloat16) and (N & (N - 1) != 0)
+        v_fft_in = v.to(torch.float32) if needs_fp32_fft else v
+        v_f = torch.fft.rfft(v_fft_in, n=N, dim=2)
+
+        # 3) Spectral gate
+        bar_q = self.norm(q.mean(dim=2))
+        gate_coeff = self.gate_mlp(bar_q)
+        gate_real = gate_coeff[..., :n_freq]
+        gate_imag = gate_coeff[..., self.n_freq_max : self.n_freq_max + n_freq]
+        gate_dtype = torch.float32 if needs_fp32_fft else v.dtype  # align with FFT dtype
+        g = torch.complex(gate_real.to(gate_dtype), gate_imag.to(gate_dtype)).unsqueeze(-1)
+
+        if self.use_phase:
+            pos = torch.arange(N, device=x.device)
+            phase = torch.exp(
+                1j
+                * 2
+                * pi
+                * self._freq_idx[:n_freq].unsqueeze(-1)
+                * pos.unsqueeze(0)
+                / N
             )
+            g = g * phase.mean(dim=-1)[None, None, :, None]
 
-        positions = torch.arange(0, L, dtype=torch.long, device=input_ids.device)
-        positions = positions.unsqueeze(0)  # (1, L)
+        v_f = v_f * g
 
-        x = self.token_embed(input_ids) + self.pos_embed[:, :L]
-        x = self.pos_drop(x)
+        # 4) Inverse FFT
+        v_t = torch.fft.irfft(v_f, n=N, dim=2)
+        if needs_fp32_fft:
+            v_t = v_t.to(v.dtype)
 
-        for blk in self.blocks:
-            x = blk(x)
+        # 5) Wavelet refinement
+        if self.wrm is not None:
+            v_t = self.wrm(v_t, bar_q)
 
-        x = self.norm(x)
-        logits = self.lm_head(x)
-        return logits
+        # 6) Output projection
+        y = self._merge_heads(v_t)
+        return self.out_proj(y)
