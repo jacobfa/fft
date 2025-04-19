@@ -1,150 +1,160 @@
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+# spectre_fast_eager.py  – no Torch‑Compile, still fast
+from __future__ import annotations
+import math, warnings as _w, contextlib
+import torch, torch.nn as nn, torch.nn.functional as F
+from torch import amp
 
+# ─── silence noisy warnings ───────────────────────────────────────────────────
+for msg in (
+    r"ComplexHalf support is experimental",
+    r"Torchinductor does not support code generation",
+    r"`torch\.cuda\.amp\.custom_fwd",
+    r"`torch\.cuda\.amp\.custom_bwd",
+):
+    _w.filterwarnings("ignore", message=msg)
 
-_INV_SQRT2 = 1.0 / math.sqrt(2.0)
+# ─── global perf knobs ────────────────────────────────────────────────────────
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+with contextlib.suppress(AttributeError):
+    torch.set_float32_matmul_precision("medium")    # TF32 without fp32 slowdown
 
+_AMP_DTYPE = torch.float16
 
+# ─── float‑16 FFT support probe ───────────────────────────────────────────────
+def _detect_fft_supported() -> set[torch.dtype]:
+    ok = {torch.float32}
+    if torch.cuda.is_available():
+        try:
+            torch.fft.rfft(torch.empty(8, device="cuda", dtype=torch.float16))
+            ok.add(torch.float16)
+        except Exception:
+            pass
+    return ok
+_FFT_OK = _detect_fft_supported()
+
+# ─── fast DropPath (no mask allocation in eval) ───────────────────────────────
+class DropPath(nn.Module):
+    def __init__(self, p=0.0): super().__init__(); self.p = float(p)
+    def forward(self, x: torch.Tensor):
+        if self.p == 0.0 or not self.training:
+            return x
+        return F.dropout(x, self.p, self.training, inplace=True)
+
+# ─── Haar helpers ─────────────────────────────────────────────────────────────
+_INV_SQRT2 = 0.7071067811865476
+
+def _dwt_haar(x: torch.Tensor) -> torch.Tensor:
+    even, odd = x[..., ::2, :], x[..., 1::2, :]
+    return torch.cat((even + odd, even - odd), -2).mul_(_INV_SQRT2)
+
+def _idwt_haar(y: torch.Tensor) -> torch.Tensor:
+    half = y.size(-2) // 2
+    low, high = y[..., :half, :], y[..., half:, :]
+    even, odd = low + high, low - high
+    out = torch.empty_like(y)
+    out[..., ::2, :], out[..., 1::2, :] = even, odd
+    return out.mul_(_INV_SQRT2)
+
+# ─── FFT mixer kernel (pure eager) ────────────────────────────────────────────
+def _mix_chunk(v: torch.Tensor, gate_c: torch.Tensor, L: int):
+    """
+    v:    (M, Lc, Dh) real
+    gate_c: (M, freq) complex
+    """
+    dt, native = v.dtype, v.dtype in _FFT_OK
+    vin = v if native else v.float()
+    spec  = torch.fft.rfft(vin, dim=1, norm="ortho")
+    spec *= gate_c.unsqueeze(-1)
+    out   = torch.fft.irfft(spec, n=L, dim=1, norm="ortho")
+    return out if native else out.to(dt)
+
+# ─── Spectre mixer (compile‑free) ─────────────────────────────────────────────
 class Spectre(nn.Module):
-    """
-    Spectral Projection and Content‑adaptive Transformer Engine (SPECTRE).
-
-    Drop‑in replacement for multi‑head self‑attention with
-    O(n·d·log n) runtime and memory.
-
-    Args
-    ----
-    d_model : int
-        Embedding dimension.
-    n_heads : int
-        Number of heads.
-    seq_len : int
-        Maximum (and compile‑time) sequence length n.
-    gate_hidden : int, optional
-        Hidden size of the gate MLP (defaults to 4·d_head).
-    wavelet : bool, optional
-        Enable the lightweight Wavelet Refinement Module (default: False).
-    """
-
+    __constants__ = ("d_model","n_heads","d_head","seq_len","chunk","wavelet")
     def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        seq_len: int,
-        gate_hidden: int | None = None,
-        wavelet: bool = False,
+        self, d_model: int, n_heads: int, seq_len: int, *,
+        chunk_size: int | None = None, gate_hidden: int | None = None,
+        wavelet: bool = False,  # no compile_inner flag anymore
     ):
         super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.d_head = d_model // n_heads
-        self.seq_len = seq_len
+        if d_model % n_heads:
+            raise ValueError("d_model must be divisible by n_heads")
+        self.d_model, self.n_heads = d_model, n_heads
+        self.d_head, self.seq_len  = d_model // n_heads, seq_len
+        self.chunk = chunk_size or seq_len
+        if self.chunk < 8:
+            raise ValueError("chunk_size must be at least 8")
         self.wavelet = wavelet
 
-        # ———————————————————————————————————— token projections ———————————————————————————————————— #
-        self.w_q = nn.Linear(d_model, d_model, bias=False)
-        self.w_v = nn.Linear(d_model, d_model, bias=False)
-        self.w_o = nn.Linear(d_model, d_model, bias=False)
+        self.pad      = (self.chunk - seq_len % self.chunk) % self.chunk
+        self.n_chunks = (seq_len + self.pad) // self.chunk
+        self.freq_f, self.freq_c = seq_len // 2 + 1, self.chunk // 2 + 1
 
-        # —————————————————————————————— content‑adaptive spectral gate —————————————————————————————— #
-        gate_hidden = gate_hidden or 4 * self.d_head
-        self.ln_q = nn.LayerNorm(self.d_head)
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(self.d_head, gate_hidden, bias=False),
-            nn.GELU(),
-            nn.Linear(gate_hidden, 2 * seq_len, bias=False),  # (real, imag)
-        )
+        # projections
+        self.w_q, self.w_v, self.w_o = (nn.Linear(d_model, d_model, False) for _ in range(3))
 
-        # ———————————————————————————— optional Wavelet Refinement Module ———————————————————————————— #
+        gh = gate_hidden or 4 * self.d_head
+        self.ln_q      = nn.LayerNorm(self.d_head, 1e-6)
+        self.g_up      = nn.Linear(self.d_head, gh, False)
+        self.g_dn_full = nn.Linear(gh, 2 * self.freq_f,  False)
+        self.g_dn_chunk= nn.Linear(gh, 2 * self.freq_c,  False)
+
         if wavelet:
-            self.wrm_mlp = nn.Sequential(
-                nn.Linear(self.d_head, gate_hidden, bias=False),
-                nn.GELU(),
-                nn.Linear(gate_hidden, seq_len, bias=False),  # real gates
-            )
+            self.wrm_up   = nn.Linear(self.d_head, gh, False)
+            self.wrm_down = nn.Linear(gh, seq_len, False)
 
-    # ———————————————————————————————— basic Haar DWT/iDWT ———————————————————————————————— #
-    @staticmethod
-    def _dwt_haar(x: torch.Tensor) -> torch.Tensor:
-        """
-        One‑level orthonormal Haar DWT along the sequence axis.
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.8)
 
-        x : (b, h, n, d_h) real
-        returns : same shape (coefficients concatenated low||high)
-        """
-        even, odd = x[..., 0::2, :], x[..., 1::2, :]
-        low = (even + odd) * _INV_SQRT2
-        high = (even - odd) * _INV_SQRT2
-        return torch.cat([low, high], dim=-2)
+    # --------------------------------------------------------------------- fwd
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, _ = x.shape
+        if N != self.seq_len:
+            raise RuntimeError(f"Spectre expected seq_len={self.seq_len}, got {N}")
 
-    @staticmethod
-    def _idwt_haar(y: torch.Tensor) -> torch.Tensor:
-        """
-        Inverse of the one‑level Haar DWT used above.
+        # == projections (AMP) ==================================================
+        with amp.autocast(device_type="cuda", dtype=_AMP_DTYPE):
+            q, v = self.w_q(x), self.w_v(x)
 
-        y : (b, h, n, d_h) real, where n is even
-        """
-        n = y.shape[-2]
-        half = n // 2
-        low, high = y[..., :half, :], y[..., half:, :]
-        even = (low + high) * _INV_SQRT2
-        odd = (low - high) * _INV_SQRT2
-        out = torch.empty_like(y)
-        out[..., 0::2, :] = even
-        out[..., 1::2, :] = odd
-        return out
+        q = q.view(B, N, self.n_heads, self.d_head).transpose(1, 2)
+        v = v.view(B, N, self.n_heads, self.d_head).transpose(1, 2)
 
-    # —————————————————————————— positional phase‑modulation stub —————————————————————————— #
-    @staticmethod
-    def _inject_position(g: torch.Tensor) -> torch.Tensor:
-        # Full equivariant phase‑modulation is omitted for efficiency.
-        return g
+        # full‑sequence path ----------------------------------------------------
+        if self.chunk >= N:
+            bar     = self.ln_q(q.mean(2))                       # (B,H,Dh)
+            gate_rt = self.g_dn_full(F.silu(self.g_up(bar))).float()
+            gate_rt = gate_rt.view(-1, self.freq_f, 2)
+            gate_c  = torch.complex(gate_rt[..., 0], gate_rt[..., 1])
 
-    # —————————————————————————————————————— forward —————————————————————————————————————— #
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: (b, n, d_model)
-        b, n, _ = x.shape
-        assert (
-            n == self.seq_len
-        ), f"SPECTRE compiled for seq_len={self.seq_len}, got {n}"
+            out = _mix_chunk(v.reshape(-1, N, self.d_head), gate_c, N)
+            v_t = out.view(B, self.n_heads, N, self.d_head)
 
-        # 1) token projections
-        q = self.w_q(x)  # (b, n, d)
-        v = self.w_v(x)
+            if self.wavelet:
+                w  = _dwt_haar(v_t)
+                s  = self.wrm_down(F.silu(self.wrm_up(bar))).view(-1, N, 1).to(v_t.dtype)
+                v_t = v_t + _idwt_haar(w.mul_(s))
 
-        # reshape to (b, h, n, d_h)
-        q = q.view(b, n, self.n_heads, self.d_head).transpose(1, 2)
-        v = v.view(b, n, self.n_heads, self.d_head).transpose(1, 2)
+        # chunked path ----------------------------------------------------------
+        else:
+            if self.pad:
+                v = F.pad(v, (0, 0, 0, self.pad))
+                q = F.pad(q, (0, 0, 0, self.pad))
 
-        # 2) global descriptor & spectral gate
-        bar_q = self.ln_q(q.mean(dim=2))  # (b, h, d_h)
-        g_raw = self.gate_mlp(bar_q)      # (b, h, 2n)
-        g_real, g_imag = g_raw.view(b, self.n_heads, 2, n).unbind(dim=2)
-        g = torch.complex(g_real, g_imag)  # (b, h, n) complex
-        g = self._inject_position(g)       # optional positional phases
+            Nc  = self.chunk
+            v   = v.view(B, self.n_heads, self.n_chunks, Nc, self.d_head)
+            bar = self.ln_q(q.view(B, self.n_heads, self.n_chunks, Nc, self.d_head).mean(3))
 
-        # 3) FFT → gating → iFFT
-        v_hat = torch.fft.fft(v, dim=2)                    # (b, h, n, d_h) complex
-        v_hat *= g.unsqueeze(-1)                           # diagonal gating
-        v_tilde = torch.fft.ifft(v_hat, dim=2).real        # (b, h, n, d_h)
+            gate_rt = self.g_dn_chunk(F.silu(self.g_up(bar))).float()
+            gate_rt = gate_rt.view(-1, self.freq_c, 2)
+            gate_c  = torch.complex(gate_rt[..., 0], gate_rt[..., 1])
 
-        # 4) optional Wavelet Refinement Module
-        if self.wavelet:
-            assert (
-                n % 2 == 0
-            ), "Wavelet module requires even sequence length."
-            w_hat = self._dwt_haar(v_tilde)                # (b, h, n, d_h)
-            s = self.wrm_mlp(bar_q).unsqueeze(-1)          # (b, h, n, 1)
-            w_hat = w_hat * s
-            v_ref = self._idwt_haar(w_hat)                 # (b, h, n, d_h)
-            v_tilde = v_tilde + v_ref
+            out = _mix_chunk(v.reshape(-1, Nc, self.d_head), gate_c, Nc)
+            v_t = out.view(B, self.n_heads, self.n_chunks, Nc, self.d_head)\
+                     .reshape(B, self.n_heads, N + self.pad, self.d_head)[..., :N, :]
 
-        # 5) heads → output projection
-        y = (
-            v_tilde.transpose(1, 2)
-            .contiguous()
-            .view(b, n, self.d_model)
-        )  # (b, n, d_model)
-        return self.w_o(y)
+        # output proj (AMP) -----------------------------------------------------
+        with amp.autocast(device_type="cuda", dtype=_AMP_DTYPE):
+            y = v_t.transpose(1, 2).reshape(B, N, self.d_model)
+            return self.w_o(y)
