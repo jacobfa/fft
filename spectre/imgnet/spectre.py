@@ -1,4 +1,3 @@
-# spectre_fast_eager.py  – no Torch‑Compile, still fast
 from __future__ import annotations
 import math, warnings as _w, contextlib
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -22,6 +21,7 @@ with contextlib.suppress(AttributeError):
 _AMP_DTYPE = torch.float16
 
 # ─── float‑16 FFT support probe ───────────────────────────────────────────────
+
 def _detect_fft_supported() -> set[torch.dtype]:
     ok = {torch.float32}
     if torch.cuda.is_available():
@@ -31,11 +31,22 @@ def _detect_fft_supported() -> set[torch.dtype]:
         except Exception:
             pass
     return ok
+
 _FFT_OK = _detect_fft_supported()
+
+# ─── helpers ──────────────────────────────────────────────────────────────────
+
+def _is_power_of_two(n: int) -> bool:
+    return n and (n & (n - 1) == 0)
+
+def _next_pow_two(n: int) -> int:
+    return 1 << (n - 1).bit_length()
 
 # ─── fast DropPath (no mask allocation in eval) ───────────────────────────────
 class DropPath(nn.Module):
-    def __init__(self, p=0.0): super().__init__(); self.p = float(p)
+    def __init__(self, p=0.0):
+        super().__init__(); self.p = float(p)
+
     def forward(self, x: torch.Tensor):
         if self.p == 0.0 or not self.training:
             return x
@@ -57,25 +68,62 @@ def _idwt_haar(y: torch.Tensor) -> torch.Tensor:
     return out.mul_(_INV_SQRT2)
 
 # ─── FFT mixer kernel (pure eager) ────────────────────────────────────────────
+
 def _mix_chunk(v: torch.Tensor, gate_c: torch.Tensor, L: int):
+    """FFT‑based mixing that keeps fp16 kernels whenever possible.
+
+    * If fp16 FFT is supported **and** *L* is a power‑of‑two → run natively.
+    * Else pad/trim in the frequency domain so shapes always match.
+    * Falls back to fp32 only as a last resort.
     """
-    v:    (M, Lc, Dh) real
-    gate_c: (M, freq) complex
-    """
-    dt, native = v.dtype, v.dtype in _FFT_OK
-    vin = v if native else v.float()
-    spec  = torch.fft.rfft(vin, dim=1, norm="ortho")
+    dt = v.dtype
+
+    # ── Case 1: native fp16 (or fp32) with power‑of‑two length ───────────────
+    if _is_power_of_two(L) and dt in _FFT_OK:
+        spec = torch.fft.rfft(v, dim=1, norm="ortho")
+        spec *= gate_c.unsqueeze(-1)
+        return torch.fft.irfft(spec, n=L, dim=1, norm="ortho")
+
+    # ── Case 2: stay in fp16 by zero‑padding to next pow‑two ─────────────────
+    if dt is torch.float16 and torch.float16 in _FFT_OK:
+        P = _next_pow_two(L)
+        pad_len = P - L
+        vin = F.pad(v, (0, 0, 0, pad_len))  # pad length‑dim (dim=1) right side
+
+        freq_target = P // 2 + 1
+        diff = freq_target - gate_c.size(1)
+        if diff > 0:
+            gate_pad = F.pad(gate_c, (0, diff))
+        elif diff < 0:
+            gate_pad = gate_c[..., :freq_target]
+        else:
+            gate_pad = gate_c
+
+        spec = torch.fft.rfft(vin, dim=1, norm="ortho")
+        spec *= gate_pad.unsqueeze(-1)
+        out = torch.fft.irfft(spec, n=P, dim=1, norm="ortho")
+        return out[:, :L, :]
+
+    # ── Case 3: fp32 fallback ────────────────────────────────────────────────
+    vin = v.float()
+    spec = torch.fft.rfft(vin, dim=1, norm="ortho")
     spec *= gate_c.unsqueeze(-1)
-    out   = torch.fft.irfft(spec, n=L, dim=1, norm="ortho")
-    return out if native else out.to(dt)
+    out = torch.fft.irfft(spec, n=L, dim=1, norm="ortho")
+    return out.to(dt)
 
 # ─── Spectre mixer (compile‑free) ─────────────────────────────────────────────
 class Spectre(nn.Module):
-    __constants__ = ("d_model","n_heads","d_head","seq_len","chunk","wavelet")
+    __constants__ = ("d_model", "n_heads", "d_head", "seq_len", "chunk", "wavelet")
+
     def __init__(
-        self, d_model: int, n_heads: int, seq_len: int, *,
-        chunk_size: int | None = None, gate_hidden: int | None = None,
-        wavelet: bool = False,  # no compile_inner flag anymore
+        self,
+        d_model: int,
+        n_heads: int,
+        seq_len: int,
+        *,
+        chunk_size: int | None = None,
+        gate_hidden: int | None = None,
+        wavelet: bool = False,
     ):
         super().__init__()
         if d_model % n_heads:
@@ -92,7 +140,9 @@ class Spectre(nn.Module):
         self.freq_f, self.freq_c = seq_len // 2 + 1, self.chunk // 2 + 1
 
         # projections
-        self.w_q, self.w_v, self.w_o = (nn.Linear(d_model, d_model, False) for _ in range(3))
+        self.w_q, self.w_v, self.w_o = (
+            nn.Linear(d_model, d_model, False) for _ in range(3)
+        )
 
         gh = gate_hidden or 4 * self.d_head
         self.ln_q      = nn.LayerNorm(self.d_head, 1e-6)
@@ -151,8 +201,10 @@ class Spectre(nn.Module):
             gate_c  = torch.complex(gate_rt[..., 0], gate_rt[..., 1])
 
             out = _mix_chunk(v.reshape(-1, Nc, self.d_head), gate_c, Nc)
-            v_t = out.view(B, self.n_heads, self.n_chunks, Nc, self.d_head)\
-                     .reshape(B, self.n_heads, N + self.pad, self.d_head)[..., :N, :]
+            v_t = (
+                out.view(B, self.n_heads, self.n_chunks, Nc, self.d_head)
+                .reshape(B, self.n_heads, N + self.pad, self.d_head)[..., :N, :]
+            )
 
         # output proj (AMP) -----------------------------------------------------
         with amp.autocast(device_type="cuda", dtype=_AMP_DTYPE):
