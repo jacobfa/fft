@@ -171,7 +171,7 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--runs", type=int, default=10)
     ap.add_argument("--seq_lens", default="128,512,1024,2048,4096,8192,16384,32768,65536,131072")
-    ap.add_argument("--batch_sizes", default="1,4,32,64")
+    ap.add_argument("--batch_sizes", default="1,32")
     args = ap.parse_args()
 
     dev = torch.device(args.device)
