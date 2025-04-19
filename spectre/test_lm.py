@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-# test_lm.py
-"""
-Comprehensive benchmark: SpectreLM vs. baseline attention vs. Flash‑SDPA GPT
-============================================================================
-
-* Benchmarks SpectreLM, a naïve GPT, Flash‑SDPA GPT (tiny wrapper),
-  and Flash‑Attention GPT **without fused‑MLP**.
-* Works on systems that lack tensor‑parallel (TP) kernels by monkey‑patching
-  a dummy `ColumnParallelLinear` class wherever Flash‑Attn expects it.
-* Catches OOM per‑model/per‑configuration and continues.
-"""
-
 from __future__ import annotations
 import argparse, csv, time, sys
 from pathlib import Path
@@ -20,7 +7,7 @@ import torch, torch.nn as nn, torch.nn.functional as F
 import matplotlib.pyplot as plt
 from transformers import GPT2Config
 
-from model import SpectreLM                    # your Spectre LM implementation
+from model import SpectreLM 
 
 # ─── Patch ColumnParallelLinear (handles all import paths) ──────────────────
 _DummyCPL = None
