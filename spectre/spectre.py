@@ -1,160 +1,109 @@
-# spectre_fast_eager.py  – no Torch‑Compile, still fast
 from __future__ import annotations
-import math, warnings as _w, contextlib
+import contextlib, warnings as _w
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch import amp
 
-# ─── silence noisy warnings ───────────────────────────────────────────────────
-for msg in (
-    r"ComplexHalf support is experimental",
-    r"Torchinductor does not support code generation",
-    r"`torch\.cuda\.amp\.custom_fwd",
-    r"`torch\.cuda\.amp\.custom_bwd",
-):
+# silence cruft
+for msg in (r"ComplexHalf", r"Torchinductor", r"custom_fwd", r"custom_bwd"):
     _w.filterwarnings("ignore", message=msg)
 
-# ─── global perf knobs ────────────────────────────────────────────────────────
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 with contextlib.suppress(AttributeError):
-    torch.set_float32_matmul_precision("medium")    # TF32 without fp32 slowdown
+    torch.set_float32_matmul_precision("medium")
 
-_AMP_DTYPE = torch.float16
+_AMP = torch.float16
 
-# ─── float‑16 FFT support probe ───────────────────────────────────────────────
-def _detect_fft_supported() -> set[torch.dtype]:
-    ok = {torch.float32}
-    if torch.cuda.is_available():
-        try:
-            torch.fft.rfft(torch.empty(8, device="cuda", dtype=torch.float16))
-            ok.add(torch.float16)
-        except Exception:
-            pass
-    return ok
-_FFT_OK = _detect_fft_supported()
+# fp16‑FFT probe
+if torch.cuda.is_available():
+    try:
+        torch.fft.rfft(torch.empty(8, device="cuda", dtype=torch.float16)); _FFT16 = True
+    except Exception:
+        _FFT16 = False
+else:
+    _FFT16 = False
 
-# ─── fast DropPath (no mask allocation in eval) ───────────────────────────────
-class DropPath(nn.Module):
-    def __init__(self, p=0.0): super().__init__(); self.p = float(p)
-    def forward(self, x: torch.Tensor):
-        if self.p == 0.0 or not self.training:
-            return x
-        return F.dropout(x, self.p, self.training, inplace=True)
-
-# ─── Haar helpers ─────────────────────────────────────────────────────────────
 _INV_SQRT2 = 0.7071067811865476
+_pow2 = lambda n: (n & (n - 1) == 0)
 
-def _dwt_haar(x: torch.Tensor) -> torch.Tensor:
-    even, odd = x[..., ::2, :], x[..., 1::2, :]
-    return torch.cat((even + odd, even - odd), -2).mul_(_INV_SQRT2)
+def _dwt(x):
+    e, o = x[..., ::2, :], x[..., 1::2, :]
+    return torch.cat((e + o, e - o), -2).mul_(_INV_SQRT2)
 
-def _idwt_haar(y: torch.Tensor) -> torch.Tensor:
-    half = y.size(-2) // 2
-    low, high = y[..., :half, :], y[..., half:, :]
-    even, odd = low + high, low - high
-    out = torch.empty_like(y)
-    out[..., ::2, :], out[..., 1::2, :] = even, odd
+def _idwt(y):
+    h = y.size(-2) // 2
+    l, hi = y[..., :h, :], y[..., h:, :]
+    e, o = l + hi, l - hi
+    out = torch.empty_like(y); out[..., ::2, :], out[..., 1::2, :] = e, o
     return out.mul_(_INV_SQRT2)
 
-# ─── FFT mixer kernel (pure eager) ────────────────────────────────────────────
-def _mix_chunk(v: torch.Tensor, gate_c: torch.Tensor, L: int):
-    """
-    v:    (M, Lc, Dh) real
-    gate_c: (M, freq) complex
-    """
-    dt, native = v.dtype, v.dtype in _FFT_OK
-    vin = v if native else v.float()
-    spec  = torch.fft.rfft(vin, dim=1, norm="ortho")
-    spec *= gate_c.unsqueeze(-1)
-    out   = torch.fft.irfft(spec, n=L, dim=1, norm="ortho")
-    return out if native else out.to(dt)
+def _mix(v: torch.Tensor, g: torch.Tensor, L: int):
+    use16 = v.dtype == torch.float16 and _FFT16 and _pow2(L)
+    x = v if use16 else v.float()
+    s = torch.fft.rfft(x, dim=1, norm="ortho"); s.mul_(g.unsqueeze(-1))
+    y = torch.fft.irfft(s, n=L, dim=1, norm="ortho")
+    return y if use16 else y.to(v.dtype)
 
-# ─── Spectre mixer (compile‑free) ─────────────────────────────────────────────
 class Spectre(nn.Module):
     __constants__ = ("d_model","n_heads","d_head","seq_len","chunk","wavelet")
-    def __init__(
-        self, d_model: int, n_heads: int, seq_len: int, *,
-        chunk_size: int | None = None, gate_hidden: int | None = None,
-        wavelet: bool = False,  # no compile_inner flag anymore
-    ):
+    def __init__(self, d_model, n_heads, seq_len, *, chunk_size=None, gate_hidden=None, wavelet=False, fused_qkv=False):
         super().__init__()
-        if d_model % n_heads:
-            raise ValueError("d_model must be divisible by n_heads")
+        if d_model % n_heads: raise ValueError
         self.d_model, self.n_heads = d_model, n_heads
-        self.d_head, self.seq_len  = d_model // n_heads, seq_len
-        self.chunk = chunk_size or seq_len
-        if self.chunk < 8:
-            raise ValueError("chunk_size must be at least 8")
-        self.wavelet = wavelet
-
-        self.pad      = (self.chunk - seq_len % self.chunk) % self.chunk
+        self.d_head, self.seq_len = d_model // n_heads, seq_len
+        self.chunk = chunk_size or seq_len; self.wavelet = wavelet; self.fused = fused_qkv
+        self.pad = (self.chunk - seq_len % self.chunk) % self.chunk
         self.n_chunks = (seq_len + self.pad) // self.chunk
-        self.freq_f, self.freq_c = seq_len // 2 + 1, self.chunk // 2 + 1
-
-        # projections
-        self.w_q, self.w_v, self.w_o = (nn.Linear(d_model, d_model, False) for _ in range(3))
-
-        gh = gate_hidden or 4 * self.d_head
-        self.ln_q      = nn.LayerNorm(self.d_head, 1e-6)
-        self.g_up      = nn.Linear(self.d_head, gh, False)
-        self.g_dn_full = nn.Linear(gh, 2 * self.freq_f,  False)
-        self.g_dn_chunk= nn.Linear(gh, 2 * self.freq_c,  False)
-
-        if wavelet:
-            self.wrm_up   = nn.Linear(self.d_head, gh, False)
-            self.wrm_down = nn.Linear(gh, seq_len, False)
-
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.8)
-
-    # --------------------------------------------------------------------- fwd
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, _ = x.shape
-        if N != self.seq_len:
-            raise RuntimeError(f"Spectre expected seq_len={self.seq_len}, got {N}")
-
-        # == projections (AMP) ==================================================
-        with amp.autocast(device_type="cuda", dtype=_AMP_DTYPE):
-            q, v = self.w_q(x), self.w_v(x)
-
-        q = q.view(B, N, self.n_heads, self.d_head).transpose(1, 2)
-        v = v.view(B, N, self.n_heads, self.d_head).transpose(1, 2)
-
-        # full‑sequence path ----------------------------------------------------
-        if self.chunk >= N:
-            bar     = self.ln_q(q.mean(2))                       # (B,H,Dh)
-            gate_rt = self.g_dn_full(F.silu(self.g_up(bar))).float()
-            gate_rt = gate_rt.view(-1, self.freq_f, 2)
-            gate_c  = torch.complex(gate_rt[..., 0], gate_rt[..., 1])
-
-            out = _mix_chunk(v.reshape(-1, N, self.d_head), gate_c, N)
-            v_t = out.view(B, self.n_heads, N, self.d_head)
-
-            if self.wavelet:
-                w  = _dwt_haar(v_t)
-                s  = self.wrm_down(F.silu(self.wrm_up(bar))).view(-1, N, 1).to(v_t.dtype)
-                v_t = v_t + _idwt_haar(w.mul_(s))
-
-        # chunked path ----------------------------------------------------------
+        self.fF, self.fC = seq_len // 2 + 1, self.chunk // 2 + 1
+        # proj
+        if fused_qkv:
+            self.w_qv = nn.Linear(d_model, 2*d_model, False)
         else:
-            if self.pad:
-                v = F.pad(v, (0, 0, 0, self.pad))
-                q = F.pad(q, (0, 0, 0, self.pad))
+            self.w_q = nn.Linear(d_model, d_model, False)
+            self.w_v = nn.Linear(d_model, d_model, False)
+        self.w_o = nn.Linear(d_model, d_model, False)
+        gh = gate_hidden or 4*self.d_head
+        self.ln_q = nn.LayerNorm(self.d_head, eps=1e-6)
+        self.g_up = nn.Linear(self.d_head, gh, False)
+        self.g_dnF = nn.Linear(gh, 2*self.fF, False)
+        self.g_dnC = nn.Linear(gh, 2*self.fC, False)
+        if wavelet:
+            self.wu = nn.Linear(self.d_head, gh, False)
+            self.wd = nn.Linear(gh, seq_len, False)
+        for m in self.modules():
+            if isinstance(m, nn.Linear): nn.init.xavier_uniform_(m.weight, 0.8)
 
-            Nc  = self.chunk
-            v   = v.view(B, self.n_heads, self.n_chunks, Nc, self.d_head)
-            bar = self.ln_q(q.view(B, self.n_heads, self.n_chunks, Nc, self.d_head).mean(3))
+    def _proj(self, x):
+        with amp.autocast(device_type="cuda", dtype=_AMP):
+            if self.fused:
+                qv = self.w_qv(x); return qv.chunk(2, -1)
+            return self.w_q(x), self.w_v(x)
 
-            gate_rt = self.g_dn_chunk(F.silu(self.g_up(bar))).float()
-            gate_rt = gate_rt.view(-1, self.freq_c, 2)
-            gate_c  = torch.complex(gate_rt[..., 0], gate_rt[..., 1])
-
-            out = _mix_chunk(v.reshape(-1, Nc, self.d_head), gate_c, Nc)
-            v_t = out.view(B, self.n_heads, self.n_chunks, Nc, self.d_head)\
-                     .reshape(B, self.n_heads, N + self.pad, self.d_head)[..., :N, :]
-
-        # output proj (AMP) -----------------------------------------------------
-        with amp.autocast(device_type="cuda", dtype=_AMP_DTYPE):
-            y = v_t.transpose(1, 2).reshape(B, N, self.d_model)
+    def forward(self, x):
+        B,N,_ = x.shape
+        if N != self.seq_len: raise RuntimeError
+        q,v = self._proj(x)
+        q = q.view(B,N,self.n_heads,self.d_head).transpose(1,2)
+        v = v.view(B,N,self.n_heads,self.d_head).transpose(1,2)
+        if self.chunk >= N:
+            with amp.autocast(device_type="cuda", dtype=_AMP):
+                bar = self.ln_q(q.mean(2)); g = self.g_dnF(F.silu(self.g_up(bar)))
+            g = g.float().view(-1,self.fF,2); gc = torch.complex(g[...,0],g[...,1])
+            vt = _mix(v.reshape(-1,N,self.d_head), gc, N).view(B,self.n_heads,N,self.d_head)
+            if self.wavelet:
+                w = _dwt(vt)
+                with amp.autocast(device_type="cuda", dtype=_AMP):
+                    s = self.wd(F.silu(self.wu(bar))).view(-1,N,1).to(vt.dtype)
+                vt = vt + _idwt(w.mul_(s))
+        else:
+            if self.pad: v = F.pad(v,(0,0,0,self.pad)); q = F.pad(q,(0,0,0,self.pad))
+            Nc = self.chunk
+            v_ = v.view(B,self.n_heads,self.n_chunks,Nc,self.d_head)
+            with amp.autocast(device_type="cuda", dtype=_AMP):
+                bar = self.ln_q(q.view(B,self.n_heads,self.n_chunks,Nc,self.d_head).mean(3))
+                g = self.g_dnC(F.silu(self.g_up(bar)))
+            g = g.float().view(-1,self.fC,2); gc = torch.complex(g[...,0],g[...,1])
+            vt = _mix(v_.reshape(-1,Nc,self.d_head), gc, Nc).view(B,self.n_heads,self.n_chunks,Nc,self.d_head).reshape(B,self.n_heads,N+self.pad,self.d_head)[...,:N,:]
+        with amp.autocast(device_type="cuda", dtype=_AMP):
+            y = vt.transpose(1,2).reshape(B,N,self.d_model)
             return self.w_o(y)
