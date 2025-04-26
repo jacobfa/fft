@@ -7,19 +7,6 @@ A lightweight PyTorch implementation of **SPECTRE** (Spectral Token Routing) ―
 
 > ⚡️ *SPECTRE achieves comparable accuracy to attention while being **O(N log N)** in sequence length and easily parallelisable across heads.*
 
----
-
-## Installation
-
-```bash
-python -m venv .venv && source .venv/bin/activate   # optional
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 # or cpu
-pip install -r requirements.txt                      # (only numpy + tqdm for the examples)
-```
-
-The code is pure-PyTorch and has no custom CUDA kernels.
-
----
 
 ## Quick Start
 
