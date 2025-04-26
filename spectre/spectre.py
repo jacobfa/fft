@@ -1,64 +1,76 @@
-# spectre.py ───────────────────────────────────────────────────────────
-# Memory-efficient SPECTRE token mixer + prefix-FFT cache
-# (full-sequence & autoregressive modes)
-# ----------------------------------------------------------------------
-
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+ 
+import warnings, logging, os
 
-# ──────────────────────────────────────────────────────────────────────
-# Helpers for real⇄complex views
-# ──────────────────────────────────────────────────────────────────────
+# 1) Hide torch.* UserWarnings / FutureWarnings
+warnings.filterwarnings("ignore", category=UserWarning,  module="torch")
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
+
+# 2) Mute the torch logger (e.g. CUDA info messages)
+logging.getLogger("torch").setLevel(logging.ERROR)
+ 
+# ---------------------------------------------------------------------
+# Utility: complex helpers
+# ---------------------------------------------------------------------
+
 def view_as_complex(x: torch.Tensor) -> torch.Tensor:
-    return torch.view_as_complex(x)          # last-dim must be 2
+    """Real-tensor view → complex-tensor view (expects last dim == 2)."""
+    return torch.view_as_complex(x)           # <— no dim shuffle
 
 def view_as_real(x: torch.Tensor) -> torch.Tensor:
-    return torch.view_as_real(x)             # append last-dim = 2
+    """Complex-tensor view → real view with last dim size 2."""
+    return torch.view_as_real(x)
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Prefix-FFT cache  (KV-cache analogue)
-# ──────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------
+# Prefix-FFT cache (KV-cache analogue)
+# ---------------------------------------------------------------------
+
 class SpectreCache:
     """
-    Stores a running RFFT and mean(q) for one autoregressive sequence.
-    prefix_fft : (H, n_fft, D)  complex64
-    sum_q      : (H, D)         float32
+    Running real-FFT of a growing sequence.
+    * prefix_fft : (Nmax//2+1, d)   complex64
+    * sum_q      : (d,)             float32      (for running mean of Q)
     """
-    def __init__(
-        self,
-        Nmax: int,
-        num_heads: int,
-        head_dim: int,
-        device: torch.device | None = None,
-    ):
+
+    def __init__(self, Nmax: int, d: int, device: torch.device | None = None):
         self.Nmax = Nmax
-        self.H, self.D = num_heads, head_dim
-        self.n_fft = Nmax // 2 + 1
+        self.d = d
         self.device = device or torch.device("cpu")
 
-        k = torch.arange(self.n_fft, device=self.device)
+        # Pre-tabulated twiddle factors e^(−j 2π k / Nmax)
+        k = torch.arange(Nmax // 2 + 1, device=self.device)
         self.base_twiddle = torch.exp(-2j * torch.pi * k / Nmax)  # (freq,)
 
         self.prefix_fft = torch.zeros(
-            self.H, self.n_fft, self.D, dtype=torch.complex64, device=self.device
+            Nmax // 2 + 1, d, dtype=torch.complex64, device=self.device
         )
-        self.sum_q = torch.zeros(self.H, self.D, device=self.device)
-        self.t = 0                                   # tokens processed
+        self.sum_q = torch.zeros(d, device=self.device)
+        self.t = 0  # current sequence length
 
     @torch.no_grad()
     def step(self, v_t: torch.Tensor, q_t: torch.Tensor) -> None:
         """
-        Append one token (v_t,q_t shapes: (H,D))
+        Ingest one token.
+        Args
+        ----
+        v_t : (d,) value projection of the new token (real)
+        q_t : (d,) query projection of the new token (real)
         """
-        phase = self.base_twiddle ** self.t              # (freq,)
-        self.prefix_fft += phase[None, :, None] * v_t[:, None, :]
+        phase = self.base_twiddle ** self.t                # (freq,)
+        self.prefix_fft += phase[:, None] * v_t            # broadcast over d
         self.sum_q += q_t
         self.t += 1
 
-    # Accessors --------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Accessors
+    # ------------------------------------------------------------------
+
     def get_fft(self) -> torch.Tensor:
         return self.prefix_fft
 
@@ -66,14 +78,19 @@ class SpectreCache:
         return self.sum_q / max(self.t, 1)
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------
 # SPECTRE mixing layer
-# ──────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------
+
 class SpectreLayer(nn.Module):
     """
-    Drop-in replacement for multi-head attention.
-    • Full-sequence mode  (training / teacher forcing)
-    • Autoregressive mode (provide a SpectreCache)
+    Frequency-domain alternative to multi-head attention.
+    Parameters
+    ----------
+    embed_dim   : model embedding size (must be divisible by num_heads)
+    num_heads   : number of heads
+    max_seq_len : Nmax (fixes the size of frequency-domain parameters)
+    low_rank_r  : rank of optional low-rank spectral update (0 = off)
     """
 
     def __init__(
@@ -84,152 +101,134 @@ class SpectreLayer(nn.Module):
         low_rank_r: int = 0,
     ):
         super().__init__()
-        assert embed_dim % num_heads == 0
-        self.E      = embed_dim
-        self.H      = num_heads
-        self.D      = embed_dim // num_heads
-        self.Nmax   = max_seq_len
-        self.n_fft  = max_seq_len // 2 + 1
-        self.rank_r = low_rank_r
+        assert (
+            embed_dim % num_heads == 0
+        ), "embed_dim must be divisible by num_heads"
 
-        # Linear projections
-        self.q_proj  = nn.Linear(self.E, self.E, bias=False)
-        self.v_proj  = nn.Linear(self.E, self.E, bias=False)
-        self.out_proj = nn.Linear(self.E, self.E, bias=False)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.max_seq_len = max_seq_len
+        self.n_fft = max_seq_len // 2 + 1
+        self.low_rank_r = low_rank_r
 
-        hidden = max(32, self.D)
+        # Projections (per head but realised as joint Linear)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        # Gating MLP: LN(d) → hidden → 2 * n_fft  (real + imag)
+        hidden = max(32, self.head_dim)
         self.gate_mlp = nn.Sequential(
-            nn.LayerNorm(self.D),
-            nn.Linear(self.D, hidden),
+            nn.LayerNorm(self.head_dim),
+            nn.Linear(self.head_dim, hidden),
             nn.SiLU(),
             nn.Linear(hidden, 2 * self.n_fft),
         )
-        if self.rank_r > 0:
+
+        if low_rank_r > 0:
+            # Two lightweight MLPs that each produce (n_fft × r × 2) real numbers
             self.U_mlp = nn.Sequential(
-                nn.LayerNorm(self.D),
-                nn.Linear(self.D, hidden),
+                nn.LayerNorm(self.head_dim),
+                nn.Linear(self.head_dim, hidden),
                 nn.SiLU(),
-                nn.Linear(hidden, 2 * self.n_fft * self.rank_r),
+                nn.Linear(hidden, 2 * self.n_fft * low_rank_r),
             )
             self.V_mlp = nn.Sequential(
-                nn.LayerNorm(self.D),
-                nn.Linear(self.D, hidden),
+                nn.LayerNorm(self.head_dim),
+                nn.Linear(self.head_dim, hidden),
                 nn.SiLU(),
-                nn.Linear(hidden, 2 * self.n_fft * self.rank_r),
+                nn.Linear(hidden, 2 * self.n_fft * low_rank_r),
             )
 
-        k = torch.arange(self.n_fft).float()
+        # Register positional phase (frequency indices)
+        k = torch.arange(self.n_fft).float()                # (n_fft,)
         self.register_buffer("freq_idx", k, persistent=False)
 
     # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
     def forward(
         self,
-        x: torch.Tensor,                        # (B,N,E)  or  (1,1,E) in AR
-        *,
-        positions: Optional[torch.Tensor] = None,
-        spectre_cache: Optional[SpectreCache] = None,
-    ) -> torch.Tensor:
-        if spectre_cache is None:
-            return self._full_sequence(x, positions)
-        else:
-            return self._autoregressive(x, spectre_cache)
-
-    # ..................................................................
-    #  Full-sequence path (memory-efficient)
-    # ..................................................................
-    def _full_sequence(
-        self,
-        x: torch.Tensor,
-        positions: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """
-        Memory footprint:
-          • v_fft          : (B,H,freq,D)  complex
-          • seq_time_dom   : (B,H,Nmax,D)  real   ← dominant tensor
-        No (freq × N) tensor is ever materialised.
-        """
-        B, N, _ = x.shape
-        H, D = self.H, self.D
-
-        # 1) Q / V projections
-        q = self.q_proj(x).view(B, N, H, D).transpose(1, 2)  # (B,H,N,D)
-        v = self.v_proj(x).view(B, N, H, D).transpose(1, 2)
-
-        # 2) FFT of values
-        v_fft = torch.fft.rfft(v, dim=2)                     # (B,H,freq,D)
-
-        # 3) Build complex gate  g_k  (B,H,freq)
-        bar_q = q.mean(dim=2)                                # (B,H,D)
-        gate  = self._build_gate(bar_q)                      # (B,H,freq)
-        spec  = v_fft * gate[..., None]                      # apply gating
-
-        # 4) Inverse FFT → time domain   (B,H,Nmax,D)
-        seq_full = torch.fft.irfft(spec, n=self.Nmax, dim=2)
-
-        # 5) Gather the slice corresponding to each token position:
-        if positions is None:
-            positions = torch.arange(N, device=x.device)
-
-        # seq_full dims: (B,H,T,D)   we gather along T
-        gather_idx = (
-            positions.view(1, 1, -1, 1)
-            .expand(B, H, -1, D)
-        )
-        v_selected = torch.gather(seq_full, dim=2, index=gather_idx)  # (B,H,N,D)
-
-        # 6) Re-assemble heads
-        v_out = (
-            v_selected.permute(0, 2, 1, 3)      # (B,N,H,D)
-            .reshape(B, N, self.E)
-        )
-        return self.out_proj(v_out)
-
-    # ..................................................................
-    #  Autoregressive path (cache)
-    # ..................................................................
-    def _autoregressive(
-        self,
-        x: torch.Tensor,               # (1,1,E)
-        cache: SpectreCache,
+        x: torch.Tensor,              # (B, N, embed_dim)
+        cache: Optional[SpectreCache] = None,
+        *,                            # keyword-only
+        positions: Optional[torch.Tensor] = None,  # (N,) absolute indices
     ) -> torch.Tensor:
         B, N, _ = x.shape
-        assert B == 1 and N == 1, "AR mode expects (1,1,E)"
-        H, D = self.H, self.D
+        H, D = self.num_heads, self.head_dim
 
-        q = self.q_proj(x).view(1, H, D)
-        v = self.v_proj(x).view(1, H, D)
-        cache.step(v[0], q[0])                      # update cache
+        # ---------------------------------------------------------------
+        # 1) Token projections
+        # ---------------------------------------------------------------
+        q = self.q_proj(x)            # (B, N, E)
+        v = self.v_proj(x)
 
-        bar_q = cache.get_bar_q().unsqueeze(0)      # (1,H,D)
-        gate  = self._build_gate(bar_q)             # (1,H,freq)
+        # head split
+        q = (
+            q.view(B, N, H, D)
+            .transpose(1, 2)          # (B, H, N, D)
+            .contiguous()
+        )
+        v = (
+            v.view(B, N, H, D)
+            .transpose(1, 2)
+            .contiguous()
+        )
 
-        spec  = cache.get_fft().unsqueeze(0) * gate[..., None]  # (1,H,freq,D)
+        # ---------------------------------------------------------------
+        # 2) Spectral transform  (RFFT along sequence)
+        # ---------------------------------------------------------------
+        v_fft = torch.fft.rfft(v, dim=2)       # (B, H, n_fft, D), complex
 
-        # Phase for current position  t = cache.t-1
-        t = cache.t - 1
-        phase = torch.exp(
-            2j * torch.pi * self.freq_idx * float(t) / self.Nmax
-        )                                            # (freq,)
-        spec = spec * phase[None, None, :, None]
+        # ---------------------------------------------------------------
+        # 3) Content-adaptive gating
+        # ---------------------------------------------------------------
+        # Global descriptor: mean over sequence
+        bar_q = q.mean(dim=2)                  # (B, H, D)
+        # Apply gate MLP to each head independently
+        gate = self.gate_mlp(bar_q)            # (B, H, 2*n_fft)
+        gate = gate.view(B, H, self.n_fft, 2)
+        gate = view_as_complex(gate)           # complex  (B, H, n_fft)
 
-        seq = torch.fft.irfft(spec, n=self.Nmax, dim=2)        # (1,H,T,D)
-        v_last = seq[..., t, :]                                # (1,H,D)
-        return self.out_proj(v_last.view(1, 1, self.E))
-
-    # ------------------------------------------------------------------
-    def _build_gate(self, bar_q: torch.Tensor) -> torch.Tensor:
-        """
-        bar_q : (B,H,D) → complex gate  (B,H,freq)
-        """
-        B = bar_q.size(0)
-        gate = self.gate_mlp(bar_q).view(B, self.H, self.n_fft, 2)
-        gate = view_as_complex(gate)                           # (B,H,freq)
-
-        if self.rank_r > 0:
-            U = self.U_mlp(bar_q).view(B, self.H, self.n_fft, self.rank_r, 2)
-            V = self.V_mlp(bar_q).view(B, self.H, self.n_fft, self.rank_r, 2)
-            U = view_as_complex(U)
+        if self.low_rank_r > 0:
+            # Optional low-rank outer product  U V^T
+            U = self.U_mlp(bar_q).view(
+                B, H, self.n_fft, self.low_rank_r, 2
+            )
+            V = self.V_mlp(bar_q).view(
+                B, H, self.n_fft, self.low_rank_r, 2
+            )
+            U = view_as_complex(U)             # (B,H,n_fft,r)
             V = view_as_complex(V)
             gate = gate + torch.einsum("...fr,...gr->...fg", U, V)
 
-        return gate
+        # Positional phase (absolute)
+        if positions is None:
+            # assume contiguous range [0, N-1]
+            positions = torch.arange(
+                N, device=x.device, dtype=torch.float32
+            )
+
+        # We need gate per freq; broadcast to D
+        gate = gate[..., None]                # (B,H,n_fft,1)
+        gate = gate.repeat(1, 1, 1, D)        # (B,H,n_fft,D)
+
+        # ---------------------------------------------------------------
+        # 4) Apply gate & inverse FFT
+        # ---------------------------------------------------------------
+        v_fft = v_fft * gate                  # complex element-wise
+        v_mixed = torch.fft.irfft(
+            v_fft, n=N, dim=2
+        )                                     # (B,H,N,D), real
+
+        # ---------------------------------------------------------------
+        # 5) Re-assemble heads and project out
+        # ---------------------------------------------------------------
+        v_mixed = (
+            v_mixed.transpose(1, 2)           # (B,N,H,D)
+            .reshape(B, N, self.embed_dim)
+        )
+        out = self.out_proj(v_mixed)          # (B, N, embed_dim)
+        return out
