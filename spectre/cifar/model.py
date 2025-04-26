@@ -1,144 +1,230 @@
+# models.py
+# ---------------------------------------------------------------------
+# Two illustrative Transformer-style models that use SPECTRE
+#  • SpectreTransformerLM  – a GPT-like language model
+#  • SpectreViT_CIFAR10    – a ViT-style vision model tuned for CIFAR-10
+# ---------------------------------------------------------------------
+# Save this file next to spectre.py and import the classes you need.
+# No training / main script is provided.
+# ---------------------------------------------------------------------
+
 from __future__ import annotations
+from typing import Optional
+
 import math
 import torch
 import torch.nn as nn
-from spectre import Spectre
+import torch.nn.functional as F
 
-# ───────────────────────────── DropPath (stochastic depth) ───────────────────────────── #
-class DropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample — identity during inference."""
-
-    def __init__(self, p: float = 0.0):
-        super().__init__()
-        self.p = p
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.p == 0.0 or not self.training:
-            return x
-        keep = 1.0 - self.p
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)    # broadcast over dims
-        mask = x.new_empty(shape).bernoulli_(keep)
-        return x * mask.div(keep)
+from spectre import SpectreLayer               # ← your previous file
 
 
-# ────────────────────────────────── utility modules ─────────────────────────────────── #
-class PatchEmbed(nn.Module):
-    def __init__(self, img_size: int = 32, patch_size: int = 4,
-                 in_chans: int = 3, embed_dim: int = 256):
-        super().__init__()
-        assert img_size % patch_size == 0
-        self.num_patches = (img_size // patch_size) ** 2
-        self.proj = nn.Conv2d(in_chans, embed_dim,
-                              kernel_size=patch_size, stride=patch_size, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)                 # (b, d, h, w)
-        return x.flatten(2).transpose(1, 2)   # (b, n, d)
-
+# ---------------------------------------------------------------------
+# Shared building blocks
+# ---------------------------------------------------------------------
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, drop: float = 0.):
+    """Simple feed-forward network used inside encoder blocks."""
+    def __init__(self, dim: int, hidden_mult: int = 4, p: float = 0.1):
         super().__init__()
-        self.fc1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.drop = nn.Dropout(drop)
+        self.lin1 = nn.Linear(dim, hidden_mult * dim)
+        self.lin2 = nn.Linear(hidden_mult * dim, dim)
+        self.act  = nn.GELU()
+        self.drop = nn.Dropout(p)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.drop(self.fc2(self.act(self.fc1(x))))
+        return self.drop(self.lin2(self.act(self.lin1(x))))
 
 
-class SpectreBlock(nn.Module):
-    """Encoder block: LayerNorm → SPECTRE → DropPath → FFN → DropPath."""
-
-    def __init__(self, dim: int, seq_len: int, n_heads: int,
-                 mlp_ratio: float, drop: float, drop_path: float):
+class SpectreEncoderLayer(nn.Module):
+    """LN-SPECTRE-drop + LN-MLP-drop (pre-norm)."""
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        max_seq_len: int,
+        low_rank_r: int = 0,
+        mlp_ratio: int = 4,
+        p_drop: float = 0.1,
+    ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.mixer = Spectre(d_model=dim, n_heads=n_heads,
-                             seq_len=seq_len, wavelet=False)
-        self.drop_path1 = DropPath(drop_path)
+        self.ln1 = nn.LayerNorm(embed_dim)
+        self.mixer = SpectreLayer(
+            embed_dim, num_heads, max_seq_len, low_rank_r
+        )
+        self.drop1 = nn.Dropout(p_drop)
 
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, int(dim * mlp_ratio), drop)
-        self.drop_path2 = DropPath(drop_path)
+        self.ln2 = nn.LayerNorm(embed_dim)
+        self.mlp = MLP(embed_dim, mlp_ratio, p_drop)
+        self.drop2 = nn.Dropout(p_drop)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.drop_path1(self.mixer(self.norm1(x)))
-        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+    def forward(
+        self,
+        x: torch.Tensor,             # (B, N, E)
+        positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = x + self.drop1(self.mixer(self.ln1(x), positions=positions))
+        x = x + self.drop2(self.mlp(self.ln2(x)))
         return x
 
 
-# ───────────────────────────────────── ViT ───────────────────────────────────── #
+# ---------------------------------------------------------------------
+# 1) Language model
+# ---------------------------------------------------------------------
+
+class SpectreTransformerLM(nn.Module):
+    """
+    GPT-style left-to-right LM using SPECTRE.
+    Defaults are relatively small; scale as needed.
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        max_seq_len: int = 1024,
+        embed_dim: int = 512,
+        depth: int = 8,
+        num_heads: int = 8,
+        low_rank_r: int = 0,
+        p_drop: float = 0.1,
+    ):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.token_emb = nn.Embedding(vocab_size, embed_dim)
+
+        self.blocks = nn.ModuleList(
+            SpectreEncoderLayer(
+                embed_dim,
+                num_heads,
+                max_seq_len,
+                low_rank_r,
+                mlp_ratio=4,
+                p_drop=p_drop,
+            )
+            for _ in range(depth)
+        )
+        self.ln_out = nn.LayerNorm(embed_dim)
+        # Weight-tied language modelling head
+        self.head = nn.Linear(embed_dim, vocab_size, bias=False)
+        self.head.weight = self.token_emb.weight
+
+        self.drop = nn.Dropout(p_drop)
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        """
+        idx : (B, N) int tokens
+        Returns logits (B, N, vocab_size)
+        """
+        B, N = idx.shape
+        assert (
+            N <= self.max_seq_len
+        ), "sequence exceeds model's max_seq_len"
+
+        pos = torch.arange(N, device=idx.device)
+
+        h = self.token_emb(idx)                  # (B, N, E)
+        h = self.drop(h)
+
+        for blk in self.blocks:
+            h = blk(h, positions=pos)
+
+        h = self.ln_out(h)
+        logits = self.head(h)                    # (B, N, V)
+        return logits
+
+
+# ---------------------------------------------------------------------
+# 2) Vision Transformer for CIFAR-10
+# ---------------------------------------------------------------------
+
+class PatchEmbed(nn.Module):
+    """
+    img (B,3,H,W) → (B, N_patches, embed_dim)
+    """
+    def __init__(self, img_size: int, patch_size: int, embed_dim: int):
+        super().__init__()
+        self.patch_size = patch_size
+        self.proj = nn.Conv2d(
+            3, embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size
+        )
+        self.num_patches = (img_size // patch_size) ** 2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # (B, C, H, W) → (B, E, H/P, W/P) → (B, N, E)
+        x = self.proj(x)
+        x = x.flatten(2).transpose(1, 2)
+        return x
+
+
 class SpectreViT(nn.Module):
     """
-    Vision Transformer using SPECTRE + stochastic depth.
-
-    CIFAR‑10 default hyper‑params:
-        img_size=32, patch_size=4, embed_dim=256, depth=8, n_heads=8
+    ViT-style classifier with SPECTRE token mixer.
+    Defaults chosen for CIFAR-10 (32×32).
     """
-
     def __init__(
         self,
         img_size: int = 32,
         patch_size: int = 4,
-        in_chans: int = 3,
-        num_classes: int = 10,
         embed_dim: int = 256,
-        depth: int = 8,
-        n_heads: int = 8,
-        mlp_ratio: float = 2.0,
-        drop: float = 0.1,
-        drop_path_rate: float = 0.1,        # ← stochastic‑depth rate (0 = off)
+        depth: int = 6,
+        num_heads: int = 4,
+        num_classes: int = 10,
+        low_rank_r: int = 0,
+        p_drop: float = 0.1,
     ):
         super().__init__()
 
-        # ─ patches & positional encoding
-        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        self.patch_embed = PatchEmbed(img_size, patch_size, embed_dim)
         n_patches = self.patch_embed.num_patches
-        self.seq_len = n_patches + 1                          # +CLS
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.seq_len, embed_dim))
-        self.pos_drop = nn.Dropout(drop)
+        self.seq_len = n_patches + 1                     # +1 for CLS
 
-        # ─ stochastic‑depth schedule (linear)
-        dpr = torch.linspace(0, drop_path_rate, depth).tolist()
+        # CLS token
+        self.cls_param = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # Learnable 1-D positional embedding (will be converted to phase)
+        self.pos_emb = nn.Parameter(torch.zeros(1, self.seq_len, embed_dim))
 
         self.blocks = nn.ModuleList(
-            [
-                SpectreBlock(
-                    dim=embed_dim,
-                    seq_len=self.seq_len,
-                    n_heads=n_heads,
-                    mlp_ratio=mlp_ratio,
-                    drop=drop,
-                    drop_path=dpr[i],
-                )
-                for i in range(depth)
-            ]
+            SpectreEncoderLayer(
+                embed_dim,
+                num_heads,
+                max_seq_len=self.seq_len,
+                low_rank_r=low_rank_r,
+                mlp_ratio=4,
+                p_drop=p_drop,
+            )
+            for _ in range(depth)
         )
 
-        self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, num_classes, bias=False)
-        self._init_weights()
+        self.ln_out = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
 
-    # ───────────────────────────────── weight init ───────────────────────────────── #
-    def _init_weights(self):
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        for m in self.modules():
-            if isinstance(m, (nn.Linear, nn.Conv2d)):
-                nn.init.xavier_uniform_(m.weight)
+        # Init
+        nn.init.trunc_normal_(self.pos_emb, std=0.02)
+        nn.init.trunc_normal_(self.cls_param, std=0.02)
 
-    # ─────────────────────────────────── forward ─────────────────────────────────── #
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b = x.size(0)
-        x = self.patch_embed(x)                                # (b, n, d)
-        x = torch.cat([self.cls_token.expand(b, -1, -1), x], 1)
-        x = self.pos_drop(x + self.pos_embed)
+        """
+        x : (B, 3, 32, 32)
+        returns logits (B, 10)
+        """
+        B = x.shape[0]
+        patches = self.patch_embed(x)                     # (B, Np, E)
+
+        cls = self.cls_param.expand(B, -1, -1)           # (B,1,E)
+        h = torch.cat([cls, patches], dim=1) + self.pos_emb
+
+        positions = torch.arange(self.seq_len, device=x.device)
 
         for blk in self.blocks:
-            x = blk(x)
+            h = blk(h, positions=positions)
 
-        x = self.norm(x)
-        return self.head(x[:, 0])
+        h = self.ln_out(h)
+        cls_final = h[:, 0]                               # CLS token
+        return self.head(cls_final)
