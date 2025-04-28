@@ -1,7 +1,4 @@
-# -*- coding: utf-8 -*-
-
 from __future__ import annotations
-
 import math
 from typing import Optional, Tuple, Dict, Any
 
@@ -14,47 +11,33 @@ warnings.filterwarnings(
     message=r"ComplexHalf support.*experimental.*",
     category=UserWarning,
 )
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
+
+def _is_power_of_two(n: int) -> bool:
+    """Returns True if *n* is a power-of-two (and > 0)."""
+    return (n & (n - 1) == 0) and n > 0
 
 
-def _complex_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def _safe_rfft(x: torch.Tensor, n: int, dim: int) -> torch.Tensor:
+    """cuFFT limitation workaround.
+
+    * If *x* is fp16 **and** *n* is not a power‑of‑two, promote to fp32 for the
+      FFT.  We **keep** the complex output in *complex32* (the default result
+      of an fp32/16 real‑to‑complex transform) because PyTorch does not support
+      complex16 and casting down would silently drop the imaginary part.
+    * Otherwise, delegate to the regular :func:`torch.fft.rfft`.
     """
-    Element-wise multiplication of two complex tensors that may be stored as
-    separate real/imag channels (…, 2) or native complex dtypes.
-    """
-    if a.is_complex() and b.is_complex():
-        return a * b
-    if a.is_complex():
-        a_real, a_imag = a.real, a.imag
-    else:
-        a_real, a_imag = a.unbind(-1)
-    if b.is_complex():
-        b_real, b_imag = b.real, b.imag
-    else:
-        b_real, b_imag = b.unbind(-1)
-    real = a_real * b_real - a_imag * b_imag
-    imag = a_real * b_imag + a_imag * b_real
-    if a.is_complex() or b.is_complex():
-        return torch.complex(real, imag)
-    return torch.stack([real, imag], dim=-1)
+    if x.dtype == torch.float16 and not _is_power_of_two(n):
+        # nb: result is complex32 – do *not* cast back to float16!
+        return torch.fft.rfft(x.float(), n=n, dim=dim)
+    return torch.fft.rfft(x, n=n, dim=dim)
 
 
-def _to_complex(x: torch.Tensor) -> torch.Tensor:
-    """Ensure tensor is complex dtype (PyTorch ≥1.10)."""
-    return x if x.is_complex() else torch.view_as_complex(x)
 
-
-def _from_complex(z: torch.Tensor, as_complex: bool) -> torch.Tensor:
-    """
-    Convert complex tensor back to (…, 2) real/imag channels if the original
-    representation was real-stacked.
-    """
-    if as_complex:
-        return z
-    return torch.view_as_real(z)
-
+def _safe_irfft(x: torch.Tensor, n: int, dim: int) -> torch.Tensor:
+    """Inverse of :func:`_safe_rfft`."""
+    if x.dtype == torch.float16 and not _is_power_of_two(n):
+        return torch.fft.irfft(x.float(), n=n, dim=dim).to(x.dtype)
+    return torch.fft.irfft(x, n=n, dim=dim)
 
 # ---------------------------------------------------------------------
 # Prefix–FFT KV-like cache
@@ -247,14 +230,15 @@ class WaveletRefinement(nn.Module):
         recon = recon.view(B, H, Dh, L).permute(0, 1, 3, 2) # (B,H,L,Dh)
         return x + recon
 
-# ---------------------------------------------------------------------
-# SPECTRE Layer
-# ---------------------------------------------------------------------
-
-
 class SPECTRELayer(nn.Module):
-    """
-    Frequency-domain mixer that can replace a multi-head attention block.
+    """Frequency‑domain mixer that can replace a multi‑head attention block.
+
+    New compared to the original implementation
+    -------------------------------------------
+    * Toeplitz depth‑wise spectral convolution (``toeplitz_bandwidth``)
+    * Complex **modReLU** activation
+    * **_safe_rfft / _safe_irfft** to avoid the *“cuFFT only supports power‑of‑two”*
+      runtime error when training with AMP/fp16.
     """
 
     def __init__(
@@ -266,6 +250,9 @@ class SPECTRELayer(nn.Module):
         low_rank: Optional[int] = None,
         use_wavelet: bool = False,
         share_gates: bool = True,
+        *,
+        toeplitz_bandwidth: int = 0,
+        use_modrelu: bool = True,
     ):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -275,19 +262,22 @@ class SPECTRELayer(nn.Module):
         self.max_seq_len = max_seq_len
         self.rank = low_rank
         self.share_gates = share_gates
+        self.bandwidth = toeplitz_bandwidth
+        self.use_modrelu = use_modrelu
+        self.eps = 1e-6
 
-        # --------------------------------------------------------------
-        # Linear projections
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Projections
+        # ------------------------------------------------------------------
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
-        # --------------------------------------------------------------
-        # Gate MLP –-> 2 · N_freq real numbers  (Re, Im) per head
-        # --------------------------------------------------------------
-        N_freq = max_seq_len // 2 + 1            # unique RFFT bins
-        gate_dim = 2 * N_freq                    # <-- fixed
+        # ------------------------------------------------------------------
+        # Gate MLP –> 2·N_freq values (Re, Im)
+        # ------------------------------------------------------------------
+        N_freq = max_seq_len // 2 + 1
+        gate_dim = 2 * N_freq
         self.gate_mlp = nn.Sequential(
             nn.LayerNorm(self.head_dim),
             nn.Linear(self.head_dim, 4 * self.head_dim),
@@ -295,11 +285,32 @@ class SPECTRELayer(nn.Module):
             nn.Linear(4 * self.head_dim, gate_dim),
         )
 
-        # --------------------------------------------------------------
-        # Optional low-rank outer-product parameters U, V
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Toeplitz convolution parameters (depth‑wise, spectral domain)
+        # ------------------------------------------------------------------
+        if self.bandwidth > 0:
+            k = 2 * self.bandwidth + 1
+            shape = (1, k) if share_gates else (n_heads, k)
+            self.t_real = nn.Parameter(torch.zeros(shape))
+            self.t_imag = nn.Parameter(torch.zeros(shape))
+        else:
+            self.register_parameter("t_real", None)
+            self.register_parameter("t_imag", None)
+
+        # ------------------------------------------------------------------
+        # modReLU bias (real‑valued)
+        # ------------------------------------------------------------------
+        if self.use_modrelu:
+            shape = (1, N_freq) if share_gates else (n_heads, N_freq)
+            self.modrelu_bias = nn.Parameter(torch.zeros(shape))
+        else:
+            self.register_parameter("modrelu_bias", None)
+
+        # ------------------------------------------------------------------
+        # Optional low‑rank outer‑product parameters U, V
+        # ------------------------------------------------------------------
         if low_rank and low_rank > 0:
-            uv_dim = 2 * N_freq * low_rank       # <-- fixed
+            uv_dim = 2 * N_freq * low_rank
             self.uv_mlp = nn.Sequential(
                 nn.LayerNorm(self.head_dim),
                 nn.Linear(self.head_dim, 4 * self.head_dim),
@@ -309,150 +320,119 @@ class SPECTRELayer(nn.Module):
         else:
             self.uv_mlp = None
 
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Optional wavelet refinement
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
         self.use_wavelet = use_wavelet
         if use_wavelet:
             self.wrm = WaveletRefinement(self.head_dim)
 
-    # === split / merge heads helpers =================================
+    # == head helpers ==================================================
 
-    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:          # (B,L,D) ➜ (B,H,L,Dh)
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:  # (B,L,D) → (B,H,L,Dh)
         B, L, _ = x.shape
         return x.view(B, L, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
 
-    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:          # (B,H,L,Dh) ➜ (B,L,D)
+    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:  # (B,H,L,Dh) → (B,L,D)
         B, H, L, Dh = x.shape
-        return x.permute(0, 2, 1, 3).contiguous().view(B, L, H * Dh)
+        return x.permute(0, 2, 1, 3).reshape(B, L, H * Dh)
 
-    # === complex gate creation =======================================
+    # == gating utilities =============================================
+
+    def _apply_toeplitz(self, g: torch.Tensor) -> torch.Tensor:
+        if self.bandwidth == 0:
+            return g
+        t = torch.complex(self.t_real, self.t_imag)  # (1|H, K)
+        offsets = range(-self.bandwidth, self.bandwidth + 1)
+        out = g
+        for idx, o in enumerate(offsets):
+            coeff = t[..., idx].unsqueeze(-1)  # (1|H,1)
+            out = out + coeff * torch.roll(g, shifts=o, dims=-1)
+        return out
+
+    def _apply_modrelu(self, g: torch.Tensor) -> torch.Tensor:
+        if not self.use_modrelu:
+            return g
+        amp = torch.abs(g)
+        bias = self.modrelu_bias.unsqueeze(0)
+        act = F.relu(amp + bias)
+        return g * act / (amp + self.eps)
+
+    # == complex gate ==================================================
 
     def _freq_gate(
         self, mean_q: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        mean_q : (B, H, Dh)
-        Returns:
-            g     : (B, 1|H, N_freq) complex gate
-            U, V  : (B, H, N_freq, r) complex   (if low-rank enabled)
-        """
         B, H, _ = mean_q.shape
         N_freq = self.max_seq_len // 2 + 1
 
-        g_raw = self.gate_mlp(mean_q)            # (B,H,2·N_freq)
-        g_real, g_imag = g_raw.split(N_freq, dim=-1)
-        
-        g_raw = self.gate_mlp(mean_q)              # (B, H, 2·N_freq)
-        g_raw = g_raw.view(B, H, 2, N_freq)        # split real/imag early
+        g_raw = self.gate_mlp(mean_q).view(B, H, 2, N_freq)
         g_real, g_imag = g_raw[..., 0, :], g_raw[..., 1, :]
-
-        if self.share_gates:                       # average per-head in real domain
-            g_real = g_real.mean(dim=1, keepdim=True)
-            g_imag = g_imag.mean(dim=1, keepdim=True)
-
-        g = torch.complex(g_real, g_imag)          # (B, 1|H, N_freq) – complex32
+        if self.share_gates:
+            g_real = g_real.mean(1, keepdim=True)
+            g_imag = g_imag.mean(1, keepdim=True)
+        g = torch.complex(g_real, g_imag)  # (B,H_or_1,N_freq)
+        g = self._apply_toeplitz(g)
+        g = self._apply_modrelu(g)
 
         if not self.rank:
             return g, None, None
-
-        # ---- low-rank outer product ---------------------------------
-        uv_raw = self.uv_mlp(mean_q)             # (B,H,2·N_freq·r)
-        uv_raw = uv_raw.view(B, H, N_freq, self.rank * 2)
-        u_real, u_imag, v_real, v_imag = torch.split(
-            uv_raw, [self.rank, self.rank, self.rank, self.rank], dim=-1
-        )
-        U = torch.complex(u_real, u_imag)
-        V = torch.complex(v_real, v_imag)
+        uv_raw = self.uv_mlp(mean_q).view(B, H, N_freq, self.rank * 2)
+        splits = torch.split(uv_raw, self.rank, dim=-1)
+        U = torch.complex(splits[0], splits[1])
+        V = torch.complex(splits[2], splits[3])
         return g, U, V
-    # -----------------------------------------------------------------
+
+    # ------------------------------------------------------------------
 
     def forward(
         self,
         x: torch.Tensor,
-        cache: Optional[PrefixFFTCache] = None,
+        cache: Optional["PrefixFFTCache"] = None,
         incremental_state: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[PrefixFFTCache]]:
-        """
-        x: (B, L, D)
-        cache: PrefixFFTCache or None
-        incremental_state:
-            False (default) → full-sequence training / inference
-            True            → step-wise generation (requires `cache`)
-        Returns (output, updated_cache)
-        """
-        B, L, D = x.shape
+    ) -> Tuple[torch.Tensor, Optional["PrefixFFTCache"]]:
 
-        # 1) token projections
-        q = self._split_heads(self.q_proj(x))  # (B, H, L, Dh)
-        v = self._split_heads(self.v_proj(x))  # (B, H, L, Dh)
+        B, L, _ = x.shape
+        q = self._split_heads(self.q_proj(x))
+        v = self._split_heads(self.v_proj(x))
 
         if incremental_state and cache is None:
             raise ValueError("Incremental decoding requires a PrefixFFTCache.")
 
+        # ---- incremental --------------------------------------------------
         if incremental_state:
-            # Step-wise generation ------------------------------------------------
-            cache.update(
-                v_t=v[:, :, -1, :],  # newest token (B,H,Dh)
-                q_t=q[:, :, -1, :],
-            )
-
-            mean_q = cache.mean_q  # (B,H,Dh)
-            g, U, V = self._freq_gate(mean_q)  # (B,H_or_1,N_freq)
-
-            # positional phase exp(j 2π k t / N_max)
-            t = cache.t - 1  # current index (0-based)
-            k = torch.arange(
-                self.max_seq_len // 2 + 1, device=x.device, dtype=torch.float
-            )
-            phase = torch.exp(
-                1j * 2 * math.pi * k * t / self.max_seq_len
-            )  # (N_freq,)
+            cache.update(v_t=v[:, :, -1, :], q_t=q[:, :, -1, :])
+            mean_q = cache.mean_q
+            g, U, V = self._freq_gate(mean_q)
+            t_idx = cache.t - 1
+            k = torch.arange(self.max_seq_len // 2 + 1, device=x.device, dtype=torch.float)
+            phase = torch.exp(1j * 2 * math.pi * k * t_idx / self.max_seq_len)
             g = g * phase.view(1, 1, -1)
-
-            # low-rank outer product
-            fft_coeff = cache.prefix_fft  # (B,H,N_freq,Dh)
+            fft_coeff = cache.prefix_fft
             if U is not None:
-                outer = torch.einsum("bhkr,bhkr->bhk", U, V.conj())
-                g = g + outer  # broadcast: (B,H,N_freq)
-
-            # apply gate
+                g = g + torch.einsum("bhkr,bhkr->bhk", U, V.conj())
             fft_coeff = fft_coeff * g.unsqueeze(-1)
-
-            # inverse transform (full length), then slice visible prefix
-            v_tilde = torch.fft.irfft(
-                fft_coeff, n=self.max_seq_len, dim=-2
-            )  # (B,H,L_max,Dh)
-            v_tilde = v_tilde[:, :, : cache.t, :]  # visible prefix
+            v_tilde = _safe_irfft(fft_coeff, n=self.max_seq_len, dim=-2)[:, :, : cache.t, :]
             out = self._merge_heads(v_tilde)
-
             if self.use_wavelet:
                 out = self._split_heads(out)
                 out = self.wrm(out, mean_q)
                 out = self._merge_heads(out)
+            return self.out_proj(out)[:, -1:, :], cache
 
-            out = self.out_proj(out)
-            return out[:, -1:, :], cache  # only the newest token
-
-        # Full-sequence path -----------------------------------------------------
-        mean_q = q.mean(dim=2)  # (B,H,Dh)
+        # ---- full sequence ----------------------------------------------
+        mean_q = q.mean(2)
         g, U, V = self._freq_gate(mean_q)
-
-        v_freq = torch.fft.rfft(v, n=L, dim=2)  # (B,H,N_freq,Dh)
-
-        # low-rank outer product addition
+        v_freq = _safe_rfft(v, n=L, dim=2)
         if U is not None:
-            outer = torch.einsum("bhkr,bhkr->bhk", U, V.conj())
-            g = g + outer  # (B,H,N_freq) or (B,1,N_freq)
-
-        v_freq = v_freq * g.unsqueeze(-1)  # apply gate
-        v_tilde = torch.fft.irfft(v_freq, n=L, dim=2)  # (B,H,L,Dh)
-
+            v_freq = v_freq * (g + torch.einsum("bhkr,bhkr->bhk", U, V.conj())).unsqueeze(-1)
+        else:
+            v_freq = v_freq * g.unsqueeze(-1)
+        v_tilde = _safe_irfft(v_freq, n=L, dim=2)
         if self.use_wavelet:
             v_tilde = self.wrm(v_tilde, mean_q)
+        return self.out_proj(self._merge_heads(v_tilde)), cache
 
-        out = self.out_proj(self._merge_heads(v_tilde))
-        return out, cache
 
     # -----------------------------------------------------------------
 
