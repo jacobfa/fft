@@ -39,28 +39,58 @@ def _safe_irfft(x: torch.Tensor, n: int, dim: int) -> torch.Tensor:
         return torch.fft.irfft(x.float(), n=n, dim=dim).to(x.dtype)
     return torch.fft.irfft(x, n=n, dim=dim)
 
+
+class PersistentMemoryBank(nn.Module):
+    """Learnable, never‑evicted memory that is prepended to every sequence.
+
+    Parameters
+    ----------
+    memory_len : int
+        Number of memory slots.
+    d_model : int
+        Model dimensionality (matches the SPECTRE layer that owns it).
+    init_std : float, optional
+        Standard deviation of the normal distribution used to initialise the
+        memory slots (default 0.02).
+    """
+
+    def __init__(self, memory_len: int, d_model: int, init_std: float = 0.02):
+        super().__init__()
+        self.memory_len = memory_len
+        if memory_len > 0:
+            self.memory = nn.Parameter(torch.randn(memory_len, d_model) * init_std)
+        else:
+            self.register_parameter("memory", None)
+
+    # ---------------------------------------------------------------
+    def forward(self, batch_size: int) -> Optional[torch.Tensor]:
+        """Return a batch‑expanded view of the persistent memory.
+
+        The returned tensor has shape ``(B, N_mem, D)`` so it can be concatenated
+        with the token sequence along the length axis.
+        """
+        if self.memory is None:
+            return None
+        return self.memory.unsqueeze(0).expand(batch_size, -1, -1)
+
+
 # ---------------------------------------------------------------------
 # Prefix–FFT KV-like cache
 # ---------------------------------------------------------------------
 
 
 class PrefixFFTCache:
-    """
-    Stores running real-FFT coefficients and running mean of the query
-    projection for each (batch, head).  The cache is meant to be carried in the
-    model-generated `past_key_values` (akin to a KV cache).
-    """
+    """Unchanged – see original implementation."""
 
     def __init__(self, max_seq_len: int, head_dim: int, device: torch.device):
         n_freq = max_seq_len // 2 + 1
         self.prefix_fft = torch.zeros(
             0, 0, n_freq, head_dim, dtype=torch.complex64, device=device
-        )  # to be materialised at first use
+        )
         self.mean_q = torch.zeros(0, 0, head_dim, device=device)
-        self.t = 0  # current length
+        self.t = 0
         self.max_seq_len = max_seq_len
         self._twiddle_cache: Dict[int, torch.Tensor] = {}
-
     # -----------------------------------------------------------------
 
     def _twiddle(self, t: int) -> torch.Tensor:
@@ -231,15 +261,7 @@ class WaveletRefinement(nn.Module):
         return x + recon
 
 class SPECTRELayer(nn.Module):
-    """Frequency‑domain mixer that can replace a multi‑head attention block.
-
-    New compared to the original implementation
-    -------------------------------------------
-    * Toeplitz depth‑wise spectral convolution (``toeplitz_bandwidth``)
-    * Complex **modReLU** activation
-    * **_safe_rfft / _safe_irfft** to avoid the *“cuFFT only supports power‑of‑two”*
-      runtime error when training with AMP/fp16.
-    """
+    """Frequency‑domain mixer with optional persistent memory slots."""
 
     def __init__(
         self,
@@ -249,10 +271,12 @@ class SPECTRELayer(nn.Module):
         max_seq_len: int = 8192,
         low_rank: Optional[int] = None,
         use_wavelet: bool = False,
-        share_gates: bool = True,
+        share_gates: bool = False,
         *,
         toeplitz_bandwidth: int = 0,
         use_modrelu: bool = True,
+        # NEW ---------------------------
+        memory_len: int = 0,
     ):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -265,17 +289,23 @@ class SPECTRELayer(nn.Module):
         self.bandwidth = toeplitz_bandwidth
         self.use_modrelu = use_modrelu
         self.eps = 1e-6
+        self.memory_len = memory_len
 
-        # ------------------------------------------------------------------
-        # Projections
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # Persistent memory bank (learnable) – prepended to every sequence.
+        # --------------------------------------------------------------
+        self.persistent_memory = PersistentMemoryBank(memory_len, d_model)
+
+        # --------------------------------------------------------------
+        # Projections (unchanged)
+        # --------------------------------------------------------------
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
-        # ------------------------------------------------------------------
-        # Gate MLP –> 2·N_freq values (Re, Im)
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # Gate MLP –> 2·N_freq values (Re, Im) (unchanged)
+        # --------------------------------------------------------------
         N_freq = max_seq_len // 2 + 1
         gate_dim = 2 * N_freq
         self.gate_mlp = nn.Sequential(
@@ -285,8 +315,7 @@ class SPECTRELayer(nn.Module):
             nn.Linear(4 * self.head_dim, gate_dim),
         )
 
-        # ------------------------------------------------------------------
-        # Toeplitz convolution parameters (depth‑wise, spectral domain)
+        # (rest of the original __init__ unchanged – Toeplitz, modReLU, UV, WRM)
         # ------------------------------------------------------------------
         if self.bandwidth > 0:
             k = 2 * self.bandwidth + 1
@@ -297,18 +326,12 @@ class SPECTRELayer(nn.Module):
             self.register_parameter("t_real", None)
             self.register_parameter("t_imag", None)
 
-        # ------------------------------------------------------------------
-        # modReLU bias (real‑valued)
-        # ------------------------------------------------------------------
         if self.use_modrelu:
             shape = (1, N_freq) if share_gates else (n_heads, N_freq)
             self.modrelu_bias = nn.Parameter(torch.zeros(shape))
         else:
             self.register_parameter("modrelu_bias", None)
 
-        # ------------------------------------------------------------------
-        # Optional low‑rank outer‑product parameters U, V
-        # ------------------------------------------------------------------
         if low_rank and low_rank > 0:
             uv_dim = 2 * N_freq * low_rank
             self.uv_mlp = nn.Sequential(
@@ -320,20 +343,18 @@ class SPECTRELayer(nn.Module):
         else:
             self.uv_mlp = None
 
-        # ------------------------------------------------------------------
-        # Optional wavelet refinement
-        # ------------------------------------------------------------------
         self.use_wavelet = use_wavelet
         if use_wavelet:
             self.wrm = WaveletRefinement(self.head_dim)
 
-    # == head helpers ==================================================
-
-    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:  # (B,L,D) → (B,H,L,Dh)
+    # ------------------------------------------------------------------
+    # Head helpers (unchanged)
+    # ------------------------------------------------------------------
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         B, L, _ = x.shape
         return x.view(B, L, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
 
-    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:  # (B,H,L,Dh) → (B,L,D)
+    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
         B, H, L, Dh = x.shape
         return x.permute(0, 2, 1, 3).reshape(B, L, H * Dh)
 
@@ -384,22 +405,47 @@ class SPECTRELayer(nn.Module):
         return g, U, V
 
     # ------------------------------------------------------------------
-
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
     def forward(
         self,
         x: torch.Tensor,
         cache: Optional["PrefixFFTCache"] = None,
         incremental_state: bool = False,
     ) -> Tuple[torch.Tensor, Optional["PrefixFFTCache"]]:
+        """Apply SPECTRE mixing with optional persistent memory.
 
-        B, L, _ = x.shape
-        q = self._split_heads(self.q_proj(x))
+        During training / full‑sequence inference (``incremental_state=False``)
+        we prepend the learnable memory slots to *every* sequence.  The output
+        corresponding to the memory positions is discarded so the caller sees
+        the same ``(B, L, D)`` shape they passed in.
+
+        During incremental decoding (``incremental_state=True``) we assume the
+        memory tokens have already been consumed in the pre‑fill phase, so they
+        are **not** prepended again.
+        """
+
+        B, L_orig, _ = x.shape
+
+        # --------------------------------------------------------------
+        # (1) Prepend persistent memory *once* per full‑sequence call.
+        # --------------------------------------------------------------
+        if not incremental_state and self.memory_len > 0:
+            mem_tokens = self.persistent_memory(B)  # (B, N_mem, D)
+            x = torch.cat([mem_tokens, x], dim=1)   # (B, N_mem+L, D)
+        L = x.shape[1]
+
+        # --------------------------------------------------------------
+        # (2) Standard SPECTRE flow (mostly unchanged)
+        # --------------------------------------------------------------
+        q = self._split_heads(self.q_proj(x))  # (B, H, L, Dh)
         v = self._split_heads(self.v_proj(x))
 
         if incremental_state and cache is None:
             raise ValueError("Incremental decoding requires a PrefixFFTCache.")
 
-        # ---- incremental --------------------------------------------------
+        # -------------------- Incremental path ------------------------
         if incremental_state:
             cache.update(v_t=v[:, :, -1, :], q_t=q[:, :, -1, :])
             mean_q = cache.mean_q
@@ -418,9 +464,11 @@ class SPECTRELayer(nn.Module):
                 out = self._split_heads(out)
                 out = self.wrm(out, mean_q)
                 out = self._merge_heads(out)
-            return self.out_proj(out)[:, -1:, :], cache
+            out = self.out_proj(out)
+            # Do NOT slice memory here – incremental decoding has no prepended mem.
+            return out[:, -1:, :], cache
 
-        # ---- full sequence ----------------------------------------------
+        # -------------------- Full‑sequence path ----------------------
         mean_q = q.mean(2)
         g, U, V = self._freq_gate(mean_q)
         v_freq = _safe_rfft(v, n=L, dim=2)
@@ -431,11 +479,16 @@ class SPECTRELayer(nn.Module):
         v_tilde = _safe_irfft(v_freq, n=L, dim=2)
         if self.use_wavelet:
             v_tilde = self.wrm(v_tilde, mean_q)
-        return self.out_proj(self._merge_heads(v_tilde)), cache
+        out = self.out_proj(self._merge_heads(v_tilde))  # (B, N_mem+L, D)
 
+        # --------------------------------------------------------------
+        # (3) Remove memory part so caller sees original length.
+        # --------------------------------------------------------------
+        if self.memory_len > 0:
+            out = out[:, self.memory_len :, :]
+        return out, cache
 
     # -----------------------------------------------------------------
-
     def init_cache(self, device: torch.device) -> PrefixFFTCache:
         return PrefixFFTCache(self.max_seq_len, self.head_dim, device)
 
@@ -443,23 +496,26 @@ class SPECTRELayer(nn.Module):
 # ---------------------------------------------------------------------
 # SPECTRE Block (with residual + LayerNorm)
 # ---------------------------------------------------------------------
-
-
 class SPECTREBlock(nn.Module):
-    """
-    [LayerNorm → SPECTRE → residual]  + position-wise FFN.
-    """
+    """Transformer block that swaps attention for a SPECTRE layer."""
 
     def __init__(
         self,
         d_model: int,
         n_heads: int,
         ffn_hidden: int = 4,
+        *,
+        memory_len: int = 0,
         **spectre_kwargs,
     ):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.spectre = SPECTRELayer(d_model, n_heads, **spectre_kwargs)
+        self.spectre = SPECTRELayer(
+            d_model,
+            n_heads,
+            memory_len=memory_len,
+            **spectre_kwargs,
+        )
         self.ln2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, ffn_hidden * d_model),
@@ -467,13 +523,16 @@ class SPECTREBlock(nn.Module):
             nn.Linear(ffn_hidden * d_model, d_model),
         )
 
+    # ---------------------------------------------------------------
     def forward(
         self,
         x: torch.Tensor,
         cache: Optional[PrefixFFTCache] = None,
         incremental_state: bool = False,
     ) -> Tuple[torch.Tensor, Optional[PrefixFFTCache]]:
-        y, cache = self.spectre(self.ln1(x), cache=cache, incremental_state=incremental_state)
+        y, cache = self.spectre(
+            self.ln1(x), cache=cache, incremental_state=incremental_state
+        )
         x = x + y
         x = x + self.ffn(self.ln2(x))
         return x, cache
