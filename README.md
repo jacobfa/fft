@@ -91,9 +91,9 @@ SPECTRELayer(
 If you use this implementation, please consider citing the original paper:
 
 ```bibtex
-@misc{feinashley2025fftstrikesagainefficient,
-      title={The FFT Strikes Again: An Efficient Alternative to Self-Attention}, 
-      author={Jacob Fein-Ashley and Rajgopal Kannan and Viktor Prasanna},
+@misc{feinashley2025spectrefftbasedefficientdropin,
+      title={SPECTRE: An FFT-Based Efficient Drop-In Replacement to Self-Attention for Long Contexts}, 
+      author={Jacob Fein-Ashley and Neelesh Gupta and Rajgopal Kannan and Viktor Prasanna},
       year={2025},
       eprint={2502.18394},
       archivePrefix={arXiv},
