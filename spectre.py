@@ -1,538 +1,882 @@
-from __future__ import annotations
-import math
-from typing import Optional, Tuple, Dict, Any
+"""
+SPECTRE: Spectral Token Routing - An FFT-Based Efficient Drop-In Replacement to Self-Attention
+
+This module implements the SPECTRE algorithm as described in the paper:
+"SPECTRE: An FFT-Based Efficient Drop-In Replacement to Self-Attention for Long Contexts"
+by Jacob Fein-Ashley, Neelesh Gupta, Rajgopal Kannan, and Viktor Prasanna (2025)
+
+Key components:
+- SPECTRELayer: Core frequency-mixing layer with O(n log n) complexity
+- PrefixFFTCache: Efficient caching mechanism for autoregressive generation
+- SPECTREBlock: Complete transformer block with SPECTRE layer
+- Optional WaveletRefinementModule: For capturing local details
+"""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import warnings
-warnings.filterwarnings(
-    "ignore",
-    message=r"ComplexHalf support.*experimental.*",
-    category=UserWarning,
-)
-
-def _is_power_of_two(n: int) -> bool:
-    """Returns True if *n* is a power-of-two (and > 0)."""
-    return (n & (n - 1) == 0) and n > 0
+import math
+from typing import Optional, Tuple, Dict, Any
+import numpy as np
 
 
-def _safe_rfft(x: torch.Tensor, n: int, dim: int) -> torch.Tensor:
-    """cuFFT limitation workaround.
-
-    * If *x* is fp16 **and** *n* is not a power‑of‑two, promote to fp32 for the
-      FFT.  We **keep** the complex output in *complex32* (the default result
-      of an fp32/16 real‑to‑complex transform) because PyTorch does not support
-      complex16 and casting down would silently drop the imaginary part.
-    * Otherwise, delegate to the regular :func:`torch.fft.rfft`.
+class ComplexModReLU(nn.Module):
     """
-    if x.dtype == torch.float16 and not _is_power_of_two(n):
-        # nb: result is complex32 – do *not* cast back to float16!
-        return torch.fft.rfft(x.float(), n=n, dim=dim)
-    return torch.fft.rfft(x, n=n, dim=dim)
-
-
-
-def _safe_irfft(x: torch.Tensor, n: int, dim: int) -> torch.Tensor:
-    """Inverse of :func:`_safe_rfft`."""
-    if x.dtype == torch.float16 and not _is_power_of_two(n):
-        return torch.fft.irfft(x.float(), n=n, dim=dim).to(x.dtype)
-    return torch.fft.irfft(x, n=n, dim=dim)
-
-
-class PersistentMemoryBank(nn.Module):
-    """Learnable, never‑evicted memory that is prepended to every sequence.
-
-    Parameters
-    ----------
-    memory_len : int
-        Number of memory slots.
-    d_model : int
-        Model dimensionality (matches the SPECTRE layer that owns it).
-    init_std : float, optional
-        Standard deviation of the normal distribution used to initialise the
-        memory slots (default 0.02).
+    Modified ReLU for complex numbers that applies ReLU to magnitude while preserving phase.
+    
+    For a complex number z = r * e^(i*θ) where r = |z| and θ = arg(z):
+    modReLU(z) = (r + b) * e^(i*θ) if r + b > 0, else 0
     """
-
-    def __init__(self, memory_len: int, d_model: int, init_std: float = 0.02):
+    def __init__(self, bias: float = 0.0):
         super().__init__()
-        self.memory_len = memory_len
-        if memory_len > 0:
-            self.memory = nn.Parameter(torch.randn(memory_len, d_model) * init_std)
-        else:
-            self.register_parameter("memory", None)
-
-    # ---------------------------------------------------------------
-    def forward(self, batch_size: int) -> Optional[torch.Tensor]:
-        """Return a batch‑expanded view of the persistent memory.
-
-        The returned tensor has shape ``(B, N_mem, D)`` so it can be concatenated
-        with the token sequence along the length axis.
-        """
-        if self.memory is None:
-            return None
-        return self.memory.unsqueeze(0).expand(batch_size, -1, -1)
-
-
-# ---------------------------------------------------------------------
-# Prefix–FFT KV-like cache
-# ---------------------------------------------------------------------
+        self.bias = nn.Parameter(torch.tensor(bias))
+    
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Apply modReLU to complex tensor."""
+        magnitude = torch.abs(z)
+        phase = torch.angle(z)
+        
+        # Apply ReLU-like threshold to magnitude
+        new_magnitude = F.relu(magnitude + self.bias)
+        
+        # Reconstruct complex number with new magnitude and same phase
+        return new_magnitude * torch.exp(1j * phase)
 
 
 class PrefixFFTCache:
-    """Unchanged – see original implementation."""
-
-    def __init__(self, max_seq_len: int, head_dim: int, device: torch.device):
-        n_freq = max_seq_len // 2 + 1
-        self.prefix_fft = torch.zeros(
-            0, 0, n_freq, head_dim, dtype=torch.complex64, device=device
-        )
-        self.mean_q = torch.zeros(0, 0, head_dim, device=device)
-        self.t = 0
+    """
+    Maintains running real-FFT coefficients and mean queries during generation.
+    Enables constant-time updates for autoregressive decoding.
+    """
+    def __init__(self, max_seq_len: int, d_model: int, n_heads: int, device: torch.device):
         self.max_seq_len = max_seq_len
-        self._twiddle_cache: Dict[int, torch.Tensor] = {}
-    # -----------------------------------------------------------------
-
-    def _twiddle(self, t: int) -> torch.Tensor:
-        """
-        Return e^(−j 2π k t / N_max) for all k in [0, N_max/2].
-        Shape: (n_freq,)
-        """
-        if t in self._twiddle_cache:
-            return self._twiddle_cache[t]
-        k = torch.arange(self.max_seq_len // 2 + 1, device=self.prefix_fft.device)
-        phase = -2 * math.pi * k.float() * t / self.max_seq_len
-        twiddle = torch.exp(1j * phase)  # complex64
-        self._twiddle_cache[t] = twiddle
-        return twiddle
-
-    # -----------------------------------------------------------------
-
-    def maybe_expand_batch(self, batch: int, n_heads: int, head_dim: int) -> None:
-        if self.prefix_fft.numel() == 0:
-            n_freq = self.max_seq_len // 2 + 1
-            self.prefix_fft = torch.zeros(
-                batch, n_heads, n_freq, head_dim, dtype=torch.complex64, device=self.mean_q.device
-            )
-            self.mean_q = torch.zeros(batch, n_heads, head_dim, device=self.mean_q.device)
-            return
-        if self.prefix_fft.shape[0] < batch:
-            pad_b = batch - self.prefix_fft.shape[0]
-            self.prefix_fft = F.pad(self.prefix_fft, (0, 0, 0, 0, 0, 0, 0, pad_b))
-            self.mean_q = F.pad(self.mean_q, (0, 0, 0, 0, 0, pad_b))
-
-    # -----------------------------------------------------------------
-
-    def update(
-        self, v_t: torch.Tensor, q_t: torch.Tensor
-    ) -> None:  # (B, H, D_head)
-        batch, n_heads, head_dim = v_t.shape
-        self.maybe_expand_batch(batch, n_heads, head_dim)
-
-        twiddle = self._twiddle(self.t)  # (n_freq,)
-        # Broadcast to (B, H, n_freq, D_head)
-        self.prefix_fft[:, :, :, :] += (
-            v_t.unsqueeze(-2) * twiddle.view(1, 1, -1, 1).to(v_t.dtype)
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.device = device
+        self.d_head = d_model // n_heads
+        
+        # Number of unique FFT coefficients for real signals
+        self.n_freq = max_seq_len // 2 + 1
+        
+        # Initialize cache tensors
+        self.prefix_fft = torch.zeros(
+            n_heads, self.n_freq, self.d_head, 
+            dtype=torch.complex64, device=device
         )
-
-        # Running mean for q
-        if self.t == 0:
-            self.mean_q[:, :, :] = q_t
+        
+        # Ring buffers for values and queries
+        self.V_buf = torch.zeros(n_heads, max_seq_len, self.d_head, device=device)
+        self.Q_buf = torch.zeros(n_heads, max_seq_len, self.d_head, device=device)
+        
+        # Running sum of queries for global context
+        self.sum_q = torch.zeros(n_heads, self.d_head, device=device)
+        
+        # Pre-compute twiddle factors for efficiency
+        self._precompute_twiddle_factors()
+        
+        # Track current position in ring buffer
+        self.position = 0
+        self.filled_len = 0
+    
+    def _precompute_twiddle_factors(self):
+        """Pre-compute e^(-j*2π*k*t/N) for all k and t."""
+        k = torch.arange(self.n_freq, device=self.device).unsqueeze(1)
+        t = torch.arange(self.max_seq_len, device=self.device).unsqueeze(0)
+        self.twiddle = torch.exp(-2j * math.pi * k * t / self.max_seq_len)
+    
+    def prefill(self, V: torch.Tensor, Q: torch.Tensor) -> None:
+        """
+        One-shot initialization for the prompt.
+        
+        Args:
+            V: Values tensor [batch, heads, seq_len, d_head]
+            Q: Queries tensor [batch, heads, seq_len, d_head]
+        """
+        batch, n_heads, seq_len, d_head = V.shape
+        assert batch == 1, "Batch size must be 1 for caching"
+        
+        # Pad to max sequence length
+        V_padded = F.pad(V[0], (0, 0, 0, self.max_seq_len - seq_len))
+        
+        # Compute FFT and store non-redundant coefficients
+        self.prefix_fft = torch.fft.rfft(V_padded, dim=1, norm='ortho')
+        
+        # Initialize ring buffers
+        self.V_buf[:, :seq_len] = V[0]
+        self.Q_buf[:, :seq_len] = Q[0]
+        
+        # Initialize running sum
+        self.sum_q = Q[0].sum(dim=1)
+        
+        self.filled_len = seq_len
+        self.position = seq_len % self.max_seq_len
+    
+    def decode_step(self, v_t: torch.Tensor, q_t: torch.Tensor, t: int) -> None:
+        """
+        Incremental update for a single new token.
+        
+        Args:
+            v_t: New value token [batch=1, heads, 1, d_head]
+            q_t: New query token [batch=1, heads, 1, d_head]
+            t: Current time step
+        """
+        v_t = v_t[0, :, 0]  # [heads, d_head]
+        q_t = q_t[0, :, 0]  # [heads, d_head]
+        
+        # Get old values if we're wrapping around
+        if t >= self.max_seq_len:
+            v_old = self.V_buf[:, self.position]
+            q_old = self.Q_buf[:, self.position]
         else:
-            self.mean_q = self.mean_q * (self.t / (self.t + 1.0)) + q_t / (self.t + 1.0)
-
-        self.t += 1
-
-    # -----------------------------------------------------------------
-
-    def state_dict(self) -> Dict[str, Any]:
-        return {
-            "prefix_fft": self.prefix_fft,
-            "mean_q": self.mean_q,
-            "t": self.t,
-        }
-
-    def load_state_dict(self, state: Dict[str, Any]) -> None:
-        self.prefix_fft = state["prefix_fft"]
-        self.mean_q = state["mean_q"]
-        self.t = state["t"]
-
-
-class HaarDWT(nn.Module):
-    """Single-level 1-D Haar analysis / synthesis, depth-wise per channel."""
-
-    def __init__(self):
-        super().__init__()
-
-        sqrt2_inv = 1.0 / math.sqrt(2.0)
-        lp = torch.tensor([sqrt2_inv, sqrt2_inv])      # low-pass  [+ +]
-        hp = torch.tensor([-sqrt2_inv, sqrt2_inv])     # high-pass [− +]
-
-        # store one copy; we’ll replicate along channel dim at runtime
-        self.register_buffer("lp_base", lp.view(1, 1, 2))   # (1,1,k)
-        self.register_buffer("hp_base", hp.view(1, 1, 2))
-
-    # -----------------------------------------------------------------
-    def _repeat(self, kernel: torch.Tensor, C: int, *, dtype, device):
-        """Make (C,1,k) kernel matching the input’s dtype / device."""
-        return kernel.to(dtype=dtype, device=device).repeat(C, 1, 1)
-
-    # -----------------------------------------------------------------
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        x : (B, C, L)  – returns (low, high) each (B, C, ⌊L/2⌋)
-        """
-        B, C, _ = x.shape
-        lp = self._repeat(self.lp_base, C, dtype=x.dtype, device=x.device)
-        hp = self._repeat(self.hp_base, C, dtype=x.dtype, device=x.device)
-
-        low  = F.conv1d(x, lp, stride=2, groups=C)
-        high = F.conv1d(x, hp, stride=2, groups=C)
-        return low, high
-
-    # -----------------------------------------------------------------
-    def inverse(self, low: torch.Tensor, high: torch.Tensor) -> torch.Tensor:
-        """
-        Inverse single-level Haar reconstruction.
-        Inputs are (B, C, L/2); output (B, C, L) (L even).
-        """
-        B, C, _ = low.shape
-
-        # Upsample by factor 2 (nearest + zero pad), shift for perfect reconstruction
-        up_lp  = F.pad(torch.repeat_interleave(low , repeats=2, dim=-1), (1, 1))
-        up_hp  = F.pad(torch.repeat_interleave(high, repeats=2, dim=-1), (1, 1))
-
-        lp_k = self._repeat(self.lp_base.flip(-1), C, dtype=low.dtype , device=low.device)
-        hp_k = self._repeat(self.hp_base.flip(-1), C, dtype=high.dtype, device=high.device)
-
-        rec_lp = F.conv1d(up_lp, lp_k, groups=C)
-        rec_hp = F.conv1d(up_hp, hp_k, groups=C)
-        return rec_lp + rec_hp
-
-# ---------------------------------------------------------------------
-# Wavelet Refinement (single-level orthogonal Haar)
-# ---------------------------------------------------------------------
+            v_old = torch.zeros_like(v_t)
+            q_old = torch.zeros_like(q_t)
+        
+        # Update FFT coefficients
+        for k in range(self.n_freq):
+            # Remove old contribution
+            if t >= self.max_seq_len:
+                old_contrib = v_old * self.twiddle[k, (t - self.max_seq_len) % self.max_seq_len]
+                self.prefix_fft[:, k] -= old_contrib
+            
+            # Add new contribution
+            new_contrib = v_t * self.twiddle[k, t % self.max_seq_len]
+            self.prefix_fft[:, k] += new_contrib
+        
+        # Update ring buffers
+        self.V_buf[:, self.position] = v_t
+        self.Q_buf[:, self.position] = q_t
+        
+        # Update running sum
+        if t >= self.max_seq_len:
+            self.sum_q = self.sum_q - q_old + q_t
+        else:
+            self.sum_q = self.sum_q + q_t
+        
+        # Update position
+        self.position = (self.position + 1) % self.max_seq_len
+        self.filled_len = min(self.filled_len + 1, self.max_seq_len)
+    
+    def get_current_fft(self) -> torch.Tensor:
+        """Get current FFT coefficients."""
+        return self.prefix_fft
+    
+    def get_mean_query(self) -> torch.Tensor:
+        """Get normalized mean query for spectral gating."""
+        return self.sum_q / self.filled_len
 
 
-
-class WaveletRefinement(nn.Module):
+class SpectralGate(nn.Module):
     """
-    Lightweight, optionally skipped DWT branch that sharpens local detail.
+    Generates content-adaptive spectral gates based on global context.
     """
-
-    def __init__(self, d_model: int, skip_init: float = 0.9):
+    def __init__(self, d_model: int, n_heads: int, max_seq_len: int, 
+                 share_gates: bool = True):
         super().__init__()
-        self.dwt = HaarDWT()
-
-        self.gating = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model),
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.n_freq = max_seq_len // 2 + 1
+        self.share_gates = share_gates
+        
+        # Two-layer MLP to generate complex gates
+        hidden_dim = d_model if share_gates else d_model * 2
+        self.mlp = nn.Sequential(
+            nn.Linear(self.d_head, hidden_dim),
             nn.GELU(),
-            nn.Linear(d_model, d_model),
-            nn.Sigmoid(),
+            nn.Linear(hidden_dim, self.n_freq * 2)  # Real and imaginary parts
         )
-
-        log_odds = math.log((1.0 - skip_init) / skip_init)
-        self.skip_logit = nn.Parameter(torch.tensor(log_odds))
-
-    # -----------------------------------------------------------------
-    def forward(self, x: torch.Tensor, global_q: torch.Tensor) -> torch.Tensor:
+        
+        # Layer norm for mean query
+        self.norm = nn.LayerNorm(self.d_head)
+    
+    def forward(self, mean_query: torch.Tensor) -> torch.Tensor:
         """
-        x        : (B, H, L, Dh)
-        global_q : (B, H, Dh)
+        Generate spectral gates from mean query.
+        
+        Args:
+            mean_query: [batch, heads, d_head] or [heads, d_head]
+            
+        Returns:
+            Complex gates [batch, heads, n_freq] or [heads, n_freq]
         """
-        if self.training:
-            do_skip = torch.rand((), device=x.device) < torch.sigmoid(self.skip_logit)
+        # Normalize mean query
+        q_norm = self.norm(mean_query)
+        
+        # Generate gates via MLP
+        if self.share_gates:
+            # Use mean across heads
+            if q_norm.dim() == 3:
+                q_shared = q_norm.mean(dim=1)  # [batch, d_head]
+            else:
+                q_shared = q_norm.mean(dim=0)  # [d_head]
+            gates_real_imag = self.mlp(q_shared)  # [batch, n_freq*2] or [n_freq*2]
         else:
-            do_skip = False
+            gates_real_imag = self.mlp(q_norm)  # [batch, heads, n_freq*2] or [heads, n_freq*2]
+        
+        # Split into real and imaginary parts
+        if gates_real_imag.dim() == 1:
+            real = gates_real_imag[:self.n_freq]
+            imag = gates_real_imag[self.n_freq:]
+            gates = torch.complex(real, imag)
+        elif gates_real_imag.dim() == 2:
+            real = gates_real_imag[..., :self.n_freq]
+            imag = gates_real_imag[..., self.n_freq:]
+            gates = torch.complex(real, imag)
+            if self.share_gates and mean_query.dim() == 3:
+                gates = gates.unsqueeze(1).expand(-1, self.n_heads, -1)
+        else:
+            real = gates_real_imag[..., :self.n_freq]
+            imag = gates_real_imag[..., self.n_freq:]
+            gates = torch.complex(real, imag)
+        
+        return gates
 
-        if do_skip:
-            return x  # fast path – branch skipped
-
-        B, H, L, Dh = x.shape
-        x_c = x.reshape(B * H, Dh, L)  # (BH, C, L)
-
-        lp, hp = self.dwt(x_c)
-        gates  = self.gating(global_q).view(B * H, Dh, 1)
-        lp, hp = lp * gates, hp * gates
-
-        recon = self.dwt.inverse(lp, hp)                    # (BH, C, L)
-        recon = recon.view(B, H, Dh, L).permute(0, 1, 3, 2) # (B,H,L,Dh)
-        return x + recon
 
 class SPECTRELayer(nn.Module):
-    """Frequency‑domain mixer with optional persistent memory slots."""
-
+    """
+    SPECTRE: Frequency-domain token mixer with optional low-rank outer product
+    and wavelet refinement branch. Drop-in replacement for Multi-Head Attention.
+    
+    Complexity: O(n log n) instead of O(n^2) for self-attention.
+    """
     def __init__(
         self,
         d_model: int,
         n_heads: int,
-        head_dim: Optional[int] = None,
         max_seq_len: int = 8192,
         low_rank: Optional[int] = None,
         use_wavelet: bool = False,
-        share_gates: bool = False,
-        *,
-        toeplitz_bandwidth: int = 0,
-        use_modrelu: bool = True,
-        # NEW ---------------------------
-        memory_len: int = 0,
+        share_gates: bool = True,
+        dropout: float = 0.0
     ):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        
         self.d_model = d_model
         self.n_heads = n_heads
-        self.head_dim = head_dim or d_model // n_heads
+        self.d_head = d_model // n_heads
         self.max_seq_len = max_seq_len
-        self.rank = low_rank
-        self.share_gates = share_gates
-        self.bandwidth = toeplitz_bandwidth
-        self.use_modrelu = use_modrelu
-        self.eps = 1e-6
-        self.memory_len = memory_len
-
-        # --------------------------------------------------------------
-        # Persistent memory bank (learnable) – prepended to every sequence.
-        # --------------------------------------------------------------
-        self.persistent_memory = PersistentMemoryBank(memory_len, d_model)
-
-        # --------------------------------------------------------------
-        # Projections (unchanged)
-        # --------------------------------------------------------------
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
-
-        # --------------------------------------------------------------
-        # Gate MLP –> 2·N_freq values (Re, Im) (unchanged)
-        # --------------------------------------------------------------
-        N_freq = max_seq_len // 2 + 1
-        gate_dim = 2 * N_freq
-        self.gate_mlp = nn.Sequential(
-            nn.LayerNorm(self.head_dim),
-            nn.Linear(self.head_dim, 4 * self.head_dim),
-            nn.GELU(),
-            nn.Linear(4 * self.head_dim, gate_dim),
-        )
-
-        # (rest of the original __init__ unchanged – Toeplitz, modReLU, UV, WRM)
-        # ------------------------------------------------------------------
-        if self.bandwidth > 0:
-            k = 2 * self.bandwidth + 1
-            shape = (1, k) if share_gates else (n_heads, k)
-            self.t_real = nn.Parameter(torch.zeros(shape))
-            self.t_imag = nn.Parameter(torch.zeros(shape))
+        self.low_rank = low_rank
+        self.use_wavelet = use_wavelet
+        
+        # Query and Value projections (per head)
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_v = nn.Linear(d_model, d_model, bias=False)
+        
+        # Output projection
+        self.W_o = nn.Linear(d_model, d_model, bias=False)
+        
+        # Spectral gating module
+        self.spectral_gate = SpectralGate(d_model, n_heads, max_seq_len, share_gates)
+        
+        # Optional low-rank Toeplitz convolution
+        if low_rank is not None:
+            self.toeplitz_kernel = nn.Parameter(
+                torch.randn(n_heads, 2 * low_rank + 1, dtype=torch.complex64) * 0.02
+            )
+        
+        # Complex activation
+        self.modrelu = ComplexModReLU(bias=0.1)
+        
+        # Optional wavelet refinement module
+        if use_wavelet:
+            self.wrm = WaveletRefinementModule(d_model, n_heads)
+            self.skip_controller = nn.Linear(self.d_head, 1)
+            self.skip_init = 0.9  # Initially skip 90% of the time
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(
+        self, 
+        x: torch.Tensor,
+        cache: Optional[PrefixFFTCache] = None,
+        incremental: bool = False,
+        position: Optional[int] = None
+    ) -> Tuple[torch.Tensor, Optional[PrefixFFTCache]]:
+        """
+        Forward pass of SPECTRE layer.
+        
+        Args:
+            x: Input tensor [batch, seq_len, d_model]
+            cache: Optional prefix-FFT cache for incremental decoding
+            incremental: Whether this is an incremental decoding step
+            position: Current position for positional phase injection
+            
+        Returns:
+            Output tensor and updated cache
+        """
+        batch, seq_len, _ = x.shape
+        
+        # Project to queries and values
+        Q = self.W_q(x).view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
+        V = self.W_v(x).view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
+        
+        if incremental and cache is not None:
+            # Incremental decoding path
+            assert seq_len == 1 and position is not None
+            
+            # Update cache with new token
+            cache.decode_step(V, Q, position)
+            
+            # Get current FFT coefficients and mean query
+            V_fft = cache.get_current_fft()
+            mean_q = cache.get_mean_query()
+            
+            # Generate spectral gates
+            gates = self.spectral_gate(mean_q)  # [heads, n_freq]
+            
+            # Get actual number of frequency bins
+            actual_n_freq = V_fft.shape[1]
+            
+            # Truncate or pad gates to match actual frequency bins
+            if gates.shape[-1] > actual_n_freq:
+                gates = gates[..., :actual_n_freq]
+            elif gates.shape[-1] < actual_n_freq:
+                gates = F.pad(gates, (0, actual_n_freq - gates.shape[-1]))
+            
+            # Reshape gates to match V_fft dimensions
+            gates = gates.unsqueeze(-1)  # [heads, n_freq, 1]
+            
+            # Apply positional phase for current position
+            k = torch.arange(actual_n_freq, device=x.device)
+            pos_phase = torch.exp(2j * math.pi * k * position / cache.max_seq_len)
+            gates = gates * pos_phase.unsqueeze(0).unsqueeze(-1)
+            
+            # Apply gates and activation
+            V_fft_gated = gates * V_fft
+            if self.low_rank is not None:
+                V_fft_gated = self._apply_toeplitz(V_fft_gated)
+            V_fft_gated = self.modrelu(V_fft_gated)
+            
+            # Inverse FFT to get output
+            V_mixed = torch.fft.irfft(V_fft_gated, n=cache.max_seq_len, dim=1, norm='ortho')
+            
+            # Extract only the last token for incremental decoding
+            # V_mixed shape: [heads, max_seq_len, d_head]
+            # We want the token at the current position
+            current_pos = (cache.position - 1) % cache.max_seq_len
+            V_mixed = V_mixed[:, current_pos:current_pos+1]  # [heads, 1, d_head]
+            
+            # Add batch dimension
+            V_mixed = V_mixed.unsqueeze(0)  # [1, heads, 1, d_head]
+            
         else:
-            self.register_parameter("t_real", None)
-            self.register_parameter("t_imag", None)
-
-        if self.use_modrelu:
-            shape = (1, N_freq) if share_gates else (n_heads, N_freq)
-            self.modrelu_bias = nn.Parameter(torch.zeros(shape))
+            # Full sequence processing
+            if cache is not None and not incremental:
+                # Pre-fill the cache
+                cache.prefill(V, Q)
+            
+            # Compute mean query for gating
+            mean_q = Q.mean(dim=2)  # [batch, heads, d_head]
+            
+            # Apply FFT to values
+            V_fft = torch.fft.rfft(V, dim=2, norm='ortho')
+            
+            # Generate and apply spectral gates
+            gates = self.spectral_gate(mean_q)  # [batch, heads, n_freq]
+            
+            # Get actual number of frequency bins from V_fft
+            actual_n_freq = V_fft.shape[2]
+            
+            # Truncate or pad gates to match actual frequency bins
+            if gates.shape[-1] > actual_n_freq:
+                gates = gates[..., :actual_n_freq]
+            elif gates.shape[-1] < actual_n_freq:
+                gates = F.pad(gates, (0, actual_n_freq - gates.shape[-1]))
+            
+            # Reshape gates to match V_fft dimensions
+            gates = gates.unsqueeze(-1)  # [batch, heads, n_freq, 1]
+            
+            # Apply positional phase if needed
+            if position is not None:
+                k = torch.arange(actual_n_freq, device=x.device)
+                pos_phase = torch.exp(2j * math.pi * k * position / seq_len)
+                gates = gates * pos_phase.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
+            
+            V_fft_gated = gates * V_fft
+            
+            # Optional low-rank update
+            if self.low_rank is not None:
+                V_fft_gated = self._apply_toeplitz(V_fft_gated)
+            
+            # Apply activation
+            V_fft_gated = self.modrelu(V_fft_gated)
+            
+            # Inverse FFT
+            V_mixed = torch.fft.irfft(V_fft_gated, n=seq_len, dim=2, norm='ortho')
+        
+        # Optional wavelet refinement
+        if self.use_wavelet:
+            # Handle mean_q shape for incremental vs batch processing
+            if incremental and mean_q.dim() == 2:
+                # Incremental: mean_q is [heads, d_head], add batch dim
+                mean_q_batch = mean_q.unsqueeze(0)  # [1, heads, d_head]
+            else:
+                mean_q_batch = mean_q  # Already [batch, heads, d_head]
+            
+            # Compute skip probability
+            skip_logits = self.skip_controller(mean_q_batch.mean(dim=-2)) + self.skip_init  # [batch, 1]
+            skip_prob = torch.sigmoid(skip_logits)
+            
+            # Apply WRM stochastically during training, deterministically during inference
+            if self.training:
+                # Sample whether to apply WRM for each batch element
+                apply_wrm_mask = torch.bernoulli(1 - skip_prob).squeeze(-1) > 0  # [batch]
+            else:
+                # Apply deterministically based on threshold
+                apply_wrm_mask = skip_prob.squeeze(-1) < 0.5  # [batch]
+            
+            # Apply WRM only if any batch element needs it
+            if apply_wrm_mask.any():
+                V_refined = self.wrm(V_mixed, mean_q_batch)
+                # Apply only to selected batch elements
+                apply_wrm_mask = apply_wrm_mask.view(-1, 1, 1, 1)
+                V_mixed = torch.where(apply_wrm_mask, V_mixed + V_refined, V_mixed)
+        
+        # Reshape and project output
+        # V_mixed shape: [batch, heads, seq_len, d_head]
+        seq_len_out = V_mixed.shape[2]
+        V_mixed = V_mixed.transpose(1, 2).contiguous()  # [batch, seq_len, heads, d_head]
+        V_mixed = V_mixed.view(batch, seq_len_out, self.d_model)  # [batch, seq_len, d_model]
+        output = self.W_o(V_mixed)
+        output = self.dropout(output)
+        
+        return output, cache
+    
+    def _apply_toeplitz(self, V_fft: torch.Tensor) -> torch.Tensor:
+        """Apply Toeplitz convolution in frequency domain."""
+        # Handle both batch and incremental cases
+        if V_fft.dim() == 4:
+            # Batch case: V_fft shape: [batch, heads, n_freq, d_head]
+            n_freq = V_fft.shape[2]
+            kernel_unsqueeze_dims = (0, -1)  # Add batch and d_head dimensions
         else:
-            self.register_parameter("modrelu_bias", None)
-
-        if low_rank and low_rank > 0:
-            uv_dim = 2 * N_freq * low_rank
-            self.uv_mlp = nn.Sequential(
-                nn.LayerNorm(self.head_dim),
-                nn.Linear(self.head_dim, 4 * self.head_dim),
-                nn.GELU(),
-                nn.Linear(4 * self.head_dim, uv_dim),
+            # Incremental case: V_fft shape: [heads, n_freq, d_head]
+            n_freq = V_fft.shape[1]
+            kernel_unsqueeze_dims = (-1,)  # Only add d_head dimension
+        
+        # Pad kernel to match frequency dimension
+        kernel_size = self.toeplitz_kernel.shape[-1]
+        if kernel_size < n_freq:
+            kernel_padded = F.pad(
+                self.toeplitz_kernel, 
+                (0, n_freq - kernel_size)
             )
         else:
-            self.uv_mlp = None
+            kernel_padded = self.toeplitz_kernel[:, :n_freq]
+        
+        # Apply depth-wise convolution in frequency domain
+        # kernel_padded shape: [n_heads, n_freq]
+        # Add dimensions for broadcasting
+        for dim in kernel_unsqueeze_dims:
+            kernel_padded = kernel_padded.unsqueeze(dim)
+        
+        return V_fft + V_fft * kernel_padded
 
-        self.use_wavelet = use_wavelet
-        if use_wavelet:
-            self.wrm = WaveletRefinement(self.head_dim)
 
-    # ------------------------------------------------------------------
-    # Head helpers (unchanged)
-    # ------------------------------------------------------------------
-    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
-        B, L, _ = x.shape
-        return x.view(B, L, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
-
-    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
-        B, H, L, Dh = x.shape
-        return x.permute(0, 2, 1, 3).reshape(B, L, H * Dh)
-
-    # == gating utilities =============================================
-
-    def _apply_toeplitz(self, g: torch.Tensor) -> torch.Tensor:
-        if self.bandwidth == 0:
-            return g
-        t = torch.complex(self.t_real, self.t_imag)  # (1|H, K)
-        offsets = range(-self.bandwidth, self.bandwidth + 1)
-        out = g
-        for idx, o in enumerate(offsets):
-            coeff = t[..., idx].unsqueeze(-1)  # (1|H,1)
-            out = out + coeff * torch.roll(g, shifts=o, dims=-1)
-        return out
-
-    def _apply_modrelu(self, g: torch.Tensor) -> torch.Tensor:
-        if not self.use_modrelu:
-            return g
-        amp = torch.abs(g)
-        bias = self.modrelu_bias.unsqueeze(0)
-        act = F.relu(amp + bias)
-        return g * act / (amp + self.eps)
-
-    # == complex gate ==================================================
-
-    def _freq_gate(
-        self, mean_q: torch.Tensor
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        B, H, _ = mean_q.shape
-        N_freq = self.max_seq_len // 2 + 1
-
-        g_raw = self.gate_mlp(mean_q).view(B, H, 2, N_freq)
-        g_real, g_imag = g_raw[..., 0, :], g_raw[..., 1, :]
-        if self.share_gates:
-            g_real = g_real.mean(1, keepdim=True)
-            g_imag = g_imag.mean(1, keepdim=True)
-        g = torch.complex(g_real, g_imag)  # (B,H_or_1,N_freq)
-        g = self._apply_toeplitz(g)
-        g = self._apply_modrelu(g)
-
-        if not self.rank:
-            return g, None, None
-        uv_raw = self.uv_mlp(mean_q).view(B, H, N_freq, self.rank * 2)
-        splits = torch.split(uv_raw, self.rank, dim=-1)
-        U = torch.complex(splits[0], splits[1])
-        V = torch.complex(splits[2], splits[3])
-        return g, U, V
-
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
-    def forward(
-        self,
-        x: torch.Tensor,
-        cache: Optional["PrefixFFTCache"] = None,
-        incremental_state: bool = False,
-    ) -> Tuple[torch.Tensor, Optional["PrefixFFTCache"]]:
-        """Apply SPECTRE mixing with optional persistent memory.
-
-        During training / full‑sequence inference (``incremental_state=False``)
-        we prepend the learnable memory slots to *every* sequence.  The output
-        corresponding to the memory positions is discarded so the caller sees
-        the same ``(B, L, D)`` shape they passed in.
-
-        During incremental decoding (``incremental_state=True``) we assume the
-        memory tokens have already been consumed in the pre‑fill phase, so they
-        are **not** prepended again.
+class WaveletRefinementModule(nn.Module):
+    """
+    Optional module to capture local details using wavelets.
+    Uses Haar wavelets for simplicity and efficiency.
+    """
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        
+        # MLP to generate wavelet gates
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(self.d_head, self.d_head * 2),
+            nn.GELU(),
+            nn.Linear(self.d_head * 2, 1)  # Per-channel gates
+        )
+        
+        # Layer norm
+        self.norm = nn.LayerNorm(self.d_head)
+    
+    def forward(self, x: torch.Tensor, mean_q: torch.Tensor) -> torch.Tensor:
         """
-
-        B, L_orig, _ = x.shape
-
-        # --------------------------------------------------------------
-        # (1) Prepend persistent memory *once* per full‑sequence call.
-        # --------------------------------------------------------------
-        if not incremental_state and self.memory_len > 0:
-            mem_tokens = self.persistent_memory(B)  # (B, N_mem, D)
-            x = torch.cat([mem_tokens, x], dim=1)   # (B, N_mem+L, D)
-        L = x.shape[1]
-
-        # --------------------------------------------------------------
-        # (2) Standard SPECTRE flow (mostly unchanged)
-        # --------------------------------------------------------------
-        q = self._split_heads(self.q_proj(x))  # (B, H, L, Dh)
-        v = self._split_heads(self.v_proj(x))
-
-        if incremental_state and cache is None:
-            raise ValueError("Incremental decoding requires a PrefixFFTCache.")
-
-        # -------------------- Incremental path ------------------------
-        if incremental_state:
-            cache.update(v_t=v[:, :, -1, :], q_t=q[:, :, -1, :])
-            mean_q = cache.mean_q
-            g, U, V = self._freq_gate(mean_q)
-            t_idx = cache.t - 1
-            k = torch.arange(self.max_seq_len // 2 + 1, device=x.device, dtype=torch.float)
-            phase = torch.exp(1j * 2 * math.pi * k * t_idx / self.max_seq_len)
-            g = g * phase.view(1, 1, -1)
-            fft_coeff = cache.prefix_fft
-            if U is not None:
-                g = g + torch.einsum("bhkr,bhkr->bhk", U, V.conj())
-            fft_coeff = fft_coeff * g.unsqueeze(-1)
-            v_tilde = _safe_irfft(fft_coeff, n=self.max_seq_len, dim=-2)[:, :, : cache.t, :]
-            out = self._merge_heads(v_tilde)
-            if self.use_wavelet:
-                out = self._split_heads(out)
-                out = self.wrm(out, mean_q)
-                out = self._merge_heads(out)
-            out = self.out_proj(out)
-            # Do NOT slice memory here – incremental decoding has no prepended mem.
-            return out[:, -1:, :], cache
-
-        # -------------------- Full‑sequence path ----------------------
-        mean_q = q.mean(2)
-        g, U, V = self._freq_gate(mean_q)
-        v_freq = _safe_rfft(v, n=L, dim=2)
-        if U is not None:
-            v_freq = v_freq * (g + torch.einsum("bhkr,bhkr->bhk", U, V.conj())).unsqueeze(-1)
-        else:
-            v_freq = v_freq * g.unsqueeze(-1)
-        v_tilde = _safe_irfft(v_freq, n=L, dim=2)
-        if self.use_wavelet:
-            v_tilde = self.wrm(v_tilde, mean_q)
-        out = self.out_proj(self._merge_heads(v_tilde))  # (B, N_mem+L, D)
-
-        # --------------------------------------------------------------
-        # (3) Remove memory part so caller sees original length.
-        # --------------------------------------------------------------
-        if self.memory_len > 0:
-            out = out[:, self.memory_len :, :]
-        return out, cache
-
-    # -----------------------------------------------------------------
-    def init_cache(self, device: torch.device) -> PrefixFFTCache:
-        return PrefixFFTCache(self.max_seq_len, self.head_dim, device)
+        Apply wavelet refinement.
+        
+        Args:
+            x: Input tensor [batch, heads, seq_len, d_head]
+            mean_q: Mean query [batch, heads, d_head]
+            
+        Returns:
+            Refined tensor
+        """
+        batch, heads, seq_len, d_head = x.shape
+        
+        # Skip wavelet transform for single token (incremental decoding)
+        if seq_len == 1:
+            return torch.zeros_like(x)
+        
+        # Apply Haar DWT (simple averaging and differencing)
+        x_dwt = self._haar_dwt_1d(x)
+        
+        # Generate channel-wise gates from mean query
+        gates = self.gate_mlp(self.norm(mean_q))  # [batch, heads, 1]
+        gates = torch.sigmoid(gates).unsqueeze(-1)  # [batch, heads, 1, 1]
+        
+        # Apply gates
+        x_dwt_gated = x_dwt * gates
+        
+        # Inverse DWT
+        x_refined = self._haar_idwt_1d(x_dwt_gated)
+        
+        return x_refined[:, :, :seq_len]  # Ensure output matches input length
+    
+    def _haar_dwt_1d(self, x: torch.Tensor) -> torch.Tensor:
+        """Simple Haar wavelet transform."""
+        # Ensure even length
+        if x.shape[2] % 2 != 0:
+            x = F.pad(x, (0, 0, 0, 1))
+        
+        # Averaging and differencing
+        x_even = x[:, :, 0::2]
+        x_odd = x[:, :, 1::2]
+        
+        low = (x_even + x_odd) / math.sqrt(2)
+        high = (x_even - x_odd) / math.sqrt(2)
+        
+        return torch.cat([low, high], dim=2)
+    
+    def _haar_idwt_1d(self, x: torch.Tensor) -> torch.Tensor:
+        """Inverse Haar wavelet transform."""
+        seq_len = x.shape[2]
+        mid = seq_len // 2
+        
+        low = x[:, :, :mid]
+        high = x[:, :, mid:]
+        
+        # Reconstruct
+        x_even = (low + high) / math.sqrt(2)
+        x_odd = (low - high) / math.sqrt(2)
+        
+        # Interleave
+        output = torch.zeros_like(x)
+        output[:, :, 0::2] = x_even
+        output[:, :, 1::2] = x_odd
+        
+        return output
 
 
-# ---------------------------------------------------------------------
-# SPECTRE Block (with residual + LayerNorm)
-# ---------------------------------------------------------------------
 class SPECTREBlock(nn.Module):
-    """Transformer block that swaps attention for a SPECTRE layer."""
-
+    """
+    Complete SPECTRE transformer block with layer norm, residual connections, and FFN.
+    """
     def __init__(
         self,
         d_model: int,
         n_heads: int,
-        ffn_hidden: int = 4,
-        *,
-        memory_len: int = 0,
-        **spectre_kwargs,
+        d_ff: int,
+        max_seq_len: int = 8192,
+        low_rank: Optional[int] = None,
+        use_wavelet: bool = False,
+        share_gates: bool = True,
+        dropout: float = 0.0
     ):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
+        
+        # Layer norms
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        # SPECTRE layer
         self.spectre = SPECTRELayer(
-            d_model,
-            n_heads,
-            memory_len=memory_len,
-            **spectre_kwargs,
+            d_model=d_model,
+            n_heads=n_heads,
+            max_seq_len=max_seq_len,
+            low_rank=low_rank,
+            use_wavelet=use_wavelet,
+            share_gates=share_gates,
+            dropout=dropout
         )
-        self.ln2 = nn.LayerNorm(d_model)
+        
+        # Feed-forward network
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, ffn_hidden * d_model),
+            nn.Linear(d_model, d_ff),
             nn.GELU(),
-            nn.Linear(ffn_hidden * d_model, d_model),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout)
         )
-
-    # ---------------------------------------------------------------
+    
     def forward(
         self,
         x: torch.Tensor,
         cache: Optional[PrefixFFTCache] = None,
-        incremental_state: bool = False,
+        incremental: bool = False,
+        position: Optional[int] = None
     ) -> Tuple[torch.Tensor, Optional[PrefixFFTCache]]:
-        y, cache = self.spectre(
-            self.ln1(x), cache=cache, incremental_state=incremental_state
-        )
-        x = x + y
-        x = x + self.ffn(self.ln2(x))
+        """Forward pass with residual connections."""
+        # SPECTRE with residual
+        normed = self.norm1(x)
+        spectre_out, cache = self.spectre(normed, cache, incremental, position)
+        x = x + spectre_out
+        
+        # FFN with residual
+        x = x + self.ffn(self.norm2(x))
+        
         return x, cache
+
+
+class PersistentMemory(nn.Module):
+    """
+    Optional persistent memory bank that is prepended to every sequence.
+    Never evicted from cache, provides long-term context.
+    """
+    def __init__(self, n_mem_tokens: int, d_model: int):
+        super().__init__()
+        self.n_mem_tokens = n_mem_tokens
+        self.d_model = d_model
+        
+        # Learnable memory tokens
+        self.memory = nn.Parameter(torch.randn(n_mem_tokens, d_model) * 0.02)
+        
+        # Pre-computed FFT of memory (updated in forward)
+        self.register_buffer('memory_fft', torch.zeros(
+            n_mem_tokens // 2 + 1, d_model, dtype=torch.complex64
+        ))
+    
+    def forward(self) -> torch.Tensor:
+        """Return memory tokens."""
+        return self.memory
+    
+    def update_fft(self):
+        """Update pre-computed FFT of memory."""
+        with torch.no_grad():
+            self.memory_fft = torch.fft.rfft(self.memory, dim=0, norm='ortho')
+
+
+# Helper functions for model initialization
+def init_spectre_caches(
+    model: nn.Module,
+    max_seq_len: int,
+    device: torch.device = torch.device('cuda')
+) -> Dict[str, PrefixFFTCache]:
+    """
+    Initialize Prefix-FFT caches for all SPECTRE layers in a model.
+    
+    Args:
+        model: Model containing SPECTRE layers
+        max_seq_len: Maximum sequence length
+        device: Device to place caches on
+        
+    Returns:
+        Dictionary mapping layer names to their caches
+    """
+    caches = {}
+    
+    for name, module in model.named_modules():
+        if isinstance(module, SPECTRELayer):
+            cache = PrefixFFTCache(
+                max_seq_len=max_seq_len,
+                d_model=module.d_model,
+                n_heads=module.n_heads,
+                device=device
+            )
+            caches[name] = cache
+    
+    return caches
+
+
+# Example usage functions
+def create_spectre_vit(
+    img_size: int = 224,
+    patch_size: int = 16,
+    embed_dim: int = 768,
+    depth: int = 12,
+    n_heads: int = 12,
+    mlp_ratio: float = 4.0,
+    num_classes: int = 1000,
+    use_wavelet: bool = False
+) -> nn.Module:
+    """
+    Create a Vision Transformer using SPECTRE layers.
+    
+    This is a simplified example showing how SPECTRE can replace
+    self-attention in vision transformers.
+    """
+    class SpectreViT(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.patch_embed = nn.Conv2d(3, embed_dim, patch_size, patch_size)
+            self.n_patches = (img_size // patch_size) ** 2
+            self.pos_embed = nn.Parameter(torch.randn(1, self.n_patches + 1, embed_dim) * 0.02)
+            self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+            
+            self.blocks = nn.ModuleList([
+                SPECTREBlock(
+                    d_model=embed_dim,
+                    n_heads=n_heads,
+                    d_ff=int(embed_dim * mlp_ratio),
+                    max_seq_len=self.n_patches + 1,
+                    use_wavelet=use_wavelet
+                )
+                for _ in range(depth)
+            ])
+            
+            self.norm = nn.LayerNorm(embed_dim)
+            self.head = nn.Linear(embed_dim, num_classes)
+        
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # Patch embedding
+            x = self.patch_embed(x).flatten(2).transpose(1, 2)
+            
+            # Add cls token
+            cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
+            x = torch.cat([cls_tokens, x], dim=1)
+            
+            # Add position embedding
+            x = x + self.pos_embed
+            
+            # SPECTRE blocks
+            for block in self.blocks:
+                x, _ = block(x)
+            
+            # Classification head
+            x = self.norm(x)
+            cls_token_final = x[:, 0]
+            return self.head(cls_token_final)
+    
+    return SpectreViT()
+
+
+def create_spectre_lm(
+    vocab_size: int,
+    max_seq_len: int = 8192,
+    d_model: int = 768,
+    n_layers: int = 12,
+    n_heads: int = 12,
+    d_ff: int = 3072,
+    use_wavelet: bool = False,
+    n_mem_tokens: int = 0
+) -> nn.Module:
+    """
+    Create a language model using SPECTRE layers.
+    
+    This demonstrates how SPECTRE can be used for autoregressive
+    language modeling with efficient caching.
+    """
+    class SpectreLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.d_model = d_model
+            self.max_seq_len = max_seq_len
+            
+            self.token_embed = nn.Embedding(vocab_size, d_model)
+            self.pos_embed = nn.Embedding(max_seq_len, d_model)
+            
+            # Optional persistent memory
+            self.persistent_memory = None
+            if n_mem_tokens > 0:
+                self.persistent_memory = PersistentMemory(n_mem_tokens, d_model)
+            
+            self.blocks = nn.ModuleList([
+                SPECTREBlock(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    d_ff=d_ff,
+                    max_seq_len=max_seq_len + n_mem_tokens,
+                    use_wavelet=use_wavelet
+                )
+                for _ in range(n_layers)
+            ])
+            
+            self.norm = nn.LayerNorm(d_model)
+            self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+            
+            # Tie embeddings
+            self.lm_head.weight = self.token_embed.weight
+        
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            caches: Optional[Dict[str, PrefixFFTCache]] = None,
+            incremental: bool = False
+        ) -> Tuple[torch.Tensor, Optional[Dict[str, PrefixFFTCache]]]:
+            # Token embeddings
+            x = self.token_embed(input_ids)
+            
+            # Position embeddings
+            if incremental and caches:
+                # Get position from first cache
+                pos = list(caches.values())[0].position
+                pos_ids = torch.tensor([pos], device=x.device)
+            else:
+                pos = None
+                pos_ids = torch.arange(x.shape[1], device=x.device)
+            x = x + self.pos_embed(pos_ids).unsqueeze(0)
+            
+            # Prepend persistent memory if available
+            if self.persistent_memory is not None:
+                mem = self.persistent_memory().unsqueeze(0).expand(x.shape[0], -1, -1)
+                x = torch.cat([mem, x], dim=1)
+            
+            # Apply SPECTRE blocks
+            updated_caches = {} if caches is not None else None
+            position = pos if incremental and caches else None
+            for i, block in enumerate(self.blocks):
+                block_cache = caches.get(f'blocks.{i}.spectre', None) if caches else None
+                x, new_cache = block(x, block_cache, incremental, position)
+                if updated_caches is not None and new_cache is not None:
+                    updated_caches[f'blocks.{i}.spectre'] = new_cache
+            
+            # Final norm and output projection
+            x = self.norm(x)
+            
+            # Remove memory tokens from output
+            if self.persistent_memory is not None:
+                x = x[:, self.persistent_memory.n_mem_tokens:]
+            
+            logits = self.lm_head(x)
+            
+            return logits, updated_caches
+    
+    return SpectreLM()
+
+
+if __name__ == "__main__":
+    # Test basic functionality
+    print("Testing SPECTRE implementation...")
+    
+    # Test parameters
+    batch_size = 2
+    seq_len = 1024
+    d_model = 512
+    n_heads = 8
+    
+    # Create a SPECTRE layer
+    layer = SPECTRELayer(
+        d_model=d_model,
+        n_heads=n_heads,
+        max_seq_len=2048,
+        low_rank=16,
+        use_wavelet=True
+    )
+    
+    # Test forward pass
+    x = torch.randn(batch_size, seq_len, d_model)
+    output, _ = layer(x)
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {output.shape}")
+    
+    # Test incremental decoding
+    cache = PrefixFFTCache(
+        max_seq_len=2048,
+        d_model=d_model,
+        n_heads=n_heads,
+        device=x.device
+    )
+    
+    # Pre-fill with initial sequence
+    layer(x[:1], cache=cache, incremental=False)
+    
+    # Incremental step
+    new_token = torch.randn(1, 1, d_model)
+    inc_output, _ = layer(new_token, cache=cache, incremental=True, position=seq_len)
+    print(f"Incremental output shape: {inc_output.shape}")
+    
+    print("\nSPECTRE implementation test completed successfully!")
